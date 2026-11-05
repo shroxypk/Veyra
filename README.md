@@ -1,79 +1,34 @@
 # Veyra
 
-A small Luau panel for the Clover RPG client: **Auto Minigames**, **Auto Parry**, adjustable **Broom Speed**, **Quest Assistance**, and **Boss Attack Alerts**.
-
-All controls appear in one scrollable panel, grouped under **Automation**, **Guidance**, **Movement**, and **Controls** headings.
-
-Every feature starts disabled. Broom speed defaults to 1x, which is a complete no-op. The quest HUD stays visible when enabled even without an active quest. Drag its title area to reposition it or use minus/plus to collapse its details. **PINS** cycles through **ALL** (up to 24 nearest world pins, default), **OFF** (no world pins), and **NEAR** (one nearby target per type). Select **MAP** on the card for a top-down plot of **every loaded matching location** for the tracked quest. Nearby dots are grouped with a count instead of overlapping, and selecting a dot shows its objective and distance. World pins remain visible through scenery up to **2,000 studs** away.
+A lightweight automation panel for Clover RPG.
 
 ## Load
-
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/shroxypk/Veyra/main/main.lua"))()
 ```
 
-**Controls:** the panel opens/closes with **Right Ctrl**, minimizes with **Delete**, cycles size presets with **Insert**, and **End** is a panic stop that disables every automation at once. All four are rebindable: click a row under **Controls**, press a key, and the binding is saved. Drag the header to move the panel (including while minimized), or drag its edges/corner to resize. **Unload** disconnects everything. The panel and quest HUD are independent overlays.
+## Features
+| Feature | Description |
+|---------|-------------|
+| **Auto Minigames** | Solves harvest & mining minigames |
+| **Auto Parry** | Times parries from animation data (180 profiles) |
+| **Quest Assistance** | Tracker + location map with pins |
+| **Boss Attack Alerts** | Windup warnings for profiled bosses |
+| **Broom Speed** | 1×–3× flight multiplier |
+
+## Controls
+| Key | Action |
+|-----|--------|
+| Right Ctrl | Toggle panel |
+| Delete | Minimize |
+| Insert | Cycle size |
+| End | Panic stop (disables all) |
+*All rebindable in the Controls section.*
 
 ## Preferences
+Saved to `Veyra/config.json` (geometry, hotkeys, ranges). Automation toggles always start **off**. `Reset Settings` restores defaults.
 
-The hub stores **preferences only** in `Veyra/config.json`: broom speed, panel position/size/preset, hotkeys, parry range, quest pin mode. Automation toggles are never saved, so a reload always starts with everything off. Writes are debounced, every file access is `pcall`-guarded, and a corrupt or hand-edited file falls back to defaults instead of breaking the panel. **Reset Settings** restores defaults. Derived parry timings are cached separately in `Veyra/parry_derived.json`.
-
-## Features
-
-| Feature | What it does | Limit |
-| --- | --- | --- |
-| Auto Minigames | Reads the game's own round data and presses Space / moves the mouse at the right moment. Play normally; every harvest and mining game is solved for you. | Solver thread only runs while a minigame is open. |
-| Broom Speed | Requests a 1x to 3x horizontal flight-velocity multiplier in 0.25 steps, capped client-side at 240 studs/s. | Only while mounted; the game/server may enforce a lower movement cap. Vertical velocity is untouched. |
-| Quest Assistance | Draggable quest tracker plus a **MAP** overlay of all matching loaded target positions. Clusters overlapping map dots, while world pins support ALL/NEAR/OFF. Locates gathering, hunting, return, and interaction objectives using known world names and quest hints. | The map is a schematic X/Z plot relative to the player, **not the game terrain map**. Positions must be replicated/streamed; unresolved objectives are reported rather than given invented locations. World pin highlights are capped for performance. For multi-item Locate/Find/Retrieve objectives, numbered interactive models in `Workspace.Objects.QuestObjects` take priority over generic decorative objects; each verified item is labeled individually and the HUD reports partial object coverage. `TrackPosition` is treated only as an **unverified search-area hint** if no matching quest object can be identified, and is explicitly marked blue with a question mark rather than labeled as an item. |
-| Boss Attack Alerts | Adaptive warning countdown for profiled boss animation markers: respects playback speed, measured profile offsets, distance-dependent display lead, and multi-hit sequences. | Markers are candidates, not confirmed impacts; unsupported attacks, range and server timing cannot be predicted reliably. No parry or gameplay input is sent. |
-| Auto Parry | Arms a single parry per predicted melee impact, timed from the attacking animation, the server's own grant timing, and (for unprofiled mobs) the swing's own pose data. | See [docs/parry.md](docs/parry.md); a parry cannot be held, and the first sighting of an unknown attack is covered by a bounded defensive block instead of a guessed impact. |
-
-Auto Parry never moves the character, never teleports, and never sends anything but the same `BlockInput` packet the game's own block key sends.
-
-## Feature interaction
-
-The modules share one panel, one cursor and (for some of them) one mouse button, so each boundary is explicit:
-
-* **One owner per input.** Auto Minigames only moves the mouse and taps Space, and only while a round is live. Auto Parry only sends `BlockInput`, plus a mouse-button release/resume that exists purely because a held attack blocks parrying; that release is skipped while a minigame round is live, and the button is handed straight back if a round starts. Nothing else synthesises input.
-* **Panel hover pauses automation.** While the pointer is over the panel or a drag is in progress, Auto Minigames is paused so a stray cursor cannot operate a minigame for you, and the panel's cursor takes over `MouseIconEnabled` only for that hover, restoring the previous value on exit.
-* **Stacked UI by layer.** Panel `10000`, quest guide `9998`, boss alerts `10001`; the boss alert card is non-interactive and cannot swallow clicks meant for the panel.
-* **Independent lifecycles.** Every module has its own `stop()`; unloading or reloading the hub stops them all and clears their GUIs, and a reload also releases any leftover button held by an older build.
-* **No writes to game-owned state.** The hub never touches game settings, remotes, character attributes, `WalkSpeed` or other modules' instances; Broom Speed only scales the flight `LinearVelocity` the game's own controller wrote, once per write.
-
-## Auto Parry in one paragraph
-
-The game grants a 0.25 s parry window per press and then locks you out for about 0.95 s, so the only way to make it useful is to press at the right moment and never press wrong. Veyra derives that moment from the attacker's animation markers, the measured send-to-grant latency of your machine, and the server's own cooldown timestamp. `docs/parry.md` has the measurements, the coverage proof, and the honest ceiling.
-
-Unknown mob animations can be estimated from fetched **pose data**, without requiring the player to fight to collect samples. In an exploratory comparison with 25 marker profiles, 23 of 26 reference impacts were within 0.125 seconds of a candidate (median error 0.030 seconds). This is not a measured parry success rate. A first encounter may receive a **bounded defensive block**, capped at 1.5 seconds; successful timing estimates are cached in `Veyra/parry_derived.json`. Unknown-attack classification, extra predicted hits, unblockable attacks and server timing remain limitations.
-
-## Repository layout
-
-```
-main.lua              generated single-file release (do not edit)
-src/                  runtime, panel, config, minigames, broom, quest guide, boss alerts, auto parry
-src/parry_profiles.lua  165 marker profiles + 11 pose-derived mob attacks
-tools/                build, publish, profile importers, passive timing observer
-tools/derive_parry_profiles.py  derives profiles from keyframe pose speed
-tools/derived_parry_profiles.json  pose-derived entries merged into the profile table
-tools/diagnostics/    optional read-only inspection scripts
-tests/unit/           offline tests (build integrity, importer rules, timing claims)
-tests/runtime/        Luau checks (timing math, press coverage, interface lifecycle)
-docs/                 technical notes
-```
-
-## Development
-
-```sh
-python tools/build.py                       # rebuild main.lua
-python tools/build.py --check               # fail if main.lua is stale
-python -m unittest discover -s tests/unit   # offline tests
-python tools/derive_parry_profiles.py analysis_all_probe.json  # re-derive mob profiles
-luau tests/runtime/verify_parry_math.lua    # timing math
-luau tests/runtime/verify_parry_coverage.lua  # press-coverage guarantee
-```
-
-Edit `src/`, never `main.lua`. The release is regenerated by `tools/build.py` and published by `tools/publish.py`, which refuses to publish a stale build. Boss profiles, Auto Parry's dependencies, and the preference store are embedded into the standalone release; `main.lua` does not require separate local source files.
-
-**In-game verification:** Enable Quest Assistance, track a quest that asks for multiple items, open **MAP** and confirm every loaded target appears as a dot (cluster numbers indicate multiple spots). Click several dots to verify their objective and distance. Walk until more targets stream in, and confirm the map updates. Cycle all three pin modes, drag and collapse the card, then respawn. For Boss Attack Alerts, test a known profiled boss at different distances and animation speeds. Verify warnings stop when the boss dies or leaves range. A clean offline build cannot establish in-game animation timing or server hit accuracy.
-
-Optional read-only diagnostics (no remotes, no progress changes), including a one-shot smoke test, are listed in [docs/diagnostics.md](docs/diagnostics.md).
+## Links
+- [Parry technical notes](docs/parry.md)
+- [Combat research](docs/combat-research.md)
+- [Diagnostics](docs/diagnostics.md)
