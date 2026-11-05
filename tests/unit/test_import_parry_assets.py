@@ -1,5 +1,8 @@
 """Checks the animation-marker importer's classification rules."""
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from tools import import_parry_assets as importer
 
@@ -52,6 +55,27 @@ class ImportTests(unittest.TestCase):
                 record("1", "Idle", "ReplicatedStorage.Animations.Server.Idle",
                        [("HitWindow", 0.5)], 1.0),
             ]})
+
+    def test_pose_derived_profiles_are_appended_once(self):
+        text, _, _ = importer.build({"records": [
+            record("1", "Wolf1", "ReplicatedStorage.Animations.Server.Wolf1",
+                   [("HitWindow", 0.9)], 1.2),
+        ]})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "derived.json"
+            path.write_text(json.dumps({"profiles": {
+                # Already covered by an authored marker: must not be duplicated.
+                "1": {"name": "Wolf1", "length": 1.2, "hits": [0.8]},
+                "2": {"name": "Swipe", "length": 1.0, "hits": [0.43]},
+            }}), encoding="utf-8")
+            merged, added = importer.append_derived(text, path)
+        self.assertEqual(added, 1)
+        self.assertIn('["2"]={name="Swipe",length=1.000000,hits={0.430000}}', merged)
+        self.assertIn('["1"]={name="Wolf1",length=1.200000,hits={0.900000}}', merged)
+        self.assertEqual(merged.count('["1"]'), 1)
+        self.assertTrue(merged.rstrip().endswith("}"))
+        # No derived file is a no-op, not an error.
+        self.assertEqual(importer.append_derived(text, None), (text, 0))
 
 
 if __name__ == "__main__":

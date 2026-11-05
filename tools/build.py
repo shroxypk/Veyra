@@ -11,6 +11,14 @@ def build(check=False):
     minigames = (source / "minigames.lua").read_text(encoding="utf-8")
     quest = (source / "quest_assist.lua").read_text(encoding="utf-8") if (source / "quest_assist.lua").exists() else ""
     boss_alerts = (source / "boss_alerts.lua").read_text(encoding="utf-8") if (source / "boss_alerts.lua").exists() else ""
+    # Preferences are inlined too: the release must not need executor-side files
+    # beyond the settings file it writes itself.
+    config = (source / "config.lua").read_text(encoding="utf-8") if (source / "config.lua").exists() else ""
+    if config:
+        config_dep = 'loadstring(readfile("Veyra/src/config.lua"),"config.lua")()'
+        if runtime.count(config_dep) != 1:
+            raise ValueError("Expected exactly one config dependency")
+        runtime = runtime.replace(config_dep, "(function()\n" + config + "\nend)()")
     dependency = 'loadstring(readfile("Veyra/src/minigames.lua"),"minigames.lua")()'
     if runtime.count(dependency) != 1:
         raise ValueError("Expected exactly one minigame dependency")

@@ -1,6 +1,6 @@
 # Auto Parry: timing model and evidence
 
-Auto Parry is experimental and hidden from the menu. This is its technical note. It exists so the claims
+Auto Parry is experimental and available in the panel. This is its technical note. It exists so the claims
 in `README.md` can be checked instead of trusted, and so nobody has to reverse
 engineer the reasoning later.
 
@@ -96,6 +96,35 @@ Each of these exists because the alternative costs the ~1 s lockout:
   while it waits, and a real press cancels the idle calibration pulse.
 
 ## Honest ceiling
+
+### Mob coverage and pose-derived candidates
+
+The bundled table contains 165 marker profiles and 11 additional pose-derived
+profiles. Authored entries take precedence. Unknown non-looping candidate
+animations can be fetched once per session; successful estimates are cached in
+`Veyra/parry_derived.json` with best-effort file I/O.
+
+Keyframes must be sorted by time before calculating composed pose-position
+speeds. The estimator groups bursts above `max(4, peakSpeed * 0.15)`, ending
+a burst below half that threshold. Peaks within 0.28 seconds are clustered;
+the candidate impact is the cluster midpoint plus 0.03 seconds. Derived hits
+before 0.20 seconds are conservatively discarded, not proven impossible.
+
+Against 25 known marker profiles with detected bursts, 23 of 26 reference hits
+were within 0.125 seconds (median 0.030, p90 0.128, maximum 0.611 seconds).
+Two additional profiles produced no retained burst. These are exploratory
+comparisons, not held-out validation or a measured parry success rate. Missing
+and extra predicted hits, attack classification, latency and server rules can
+still cause failures on unseen attacks.
+
+The first unknown swing may receive a defensive block, capped at 1.5 seconds,
+when ready, in range, and with no profiled attacks pending. It releases when
+the track stops or the attacker becomes invalid/out of range. A held block
+does not extend the parry window or guarantee mitigation of unblockable moves.
+
+`tools/derive_parry_profiles.py` consumes a local sorted-pose probe JSON;
+`tools/import_parry_assets.py` merges the resulting derived JSON into a marker
+dump while preserving authored profiles. Probe data is local research input.
 
 A parry cannot be held, and a whiff costs about four times the window, so
 continuous protection is impossible by design; the ceiling is roughly 26%

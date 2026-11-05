@@ -9,6 +9,7 @@ The optional residuals file (``tools/summarise_parry_obs.py`` output) bakes a
 per-asset scheduling shift measured from real impacts.
 """
 import json
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -148,9 +149,46 @@ def build(data, shifts=None):
         "-- Candidate impact times only: not proof of parryability.\n"
         "-- `offset` is a measured scheduling shift in seconds: positive means\n"
         "-- the real impact lands before the marker, so the press moves earlier.\n"
+        "-- Entries without an authored marker are pose-derived; see docs/parry.md.\n"
         "return {\n"
     )
     return header + "\n".join(lines) + "\n}\n", len(lines), skipped
+
+
+def append_derived(text, path):
+    """Merge pose-derived profiles that have no authored impact markers.
+
+    ``tools/derive_parry_profiles.py`` writes these from keyframe pose speed.
+    Marker-authored entries always win, so an asset that later gains a marker
+    dump keeps its measured timing. Returns the new text and how many entries
+    were added.
+    """
+    if not path or not path.exists():
+        return text, 0
+    data = json.loads(path.read_text(encoding="utf-8"))
+    covered = set(re.findall(r'\["(\d+)"\]', text))
+    lines = []
+    for asset, profile in sorted((data.get("profiles") or {}).items()):
+        if asset in covered:
+            continue
+        length = float(profile.get("length") or 0)
+        hits = [float(value) for value in profile.get("hits") or []
+                if isinstance(value, (int, float))]
+        if length <= 0 or not hits:
+            continue
+        name = str(profile.get("name") or f"asset {asset}").replace('"', "'")
+        fields = [
+            f'name="{name}"',
+            f"length={length:.6f}",
+            "hits={" + ",".join(f"{value:.6f}" for value in hits) + "}",
+        ]
+        lines.append(f' ["{asset}"]={{' + ",".join(fields) + "},")
+    if not lines:
+        return text, 0
+    body = text.rstrip()
+    if not body.endswith("}"):
+        raise ValueError("Profile table has no closing brace")
+    return body[:-1].rstrip("\n") + "\n" + "\n".join(lines) + "\n}\n", len(lines)
 
 
 if __name__ == "__main__":
@@ -158,6 +196,9 @@ if __name__ == "__main__":
     shift_source = sys.argv[2] if len(sys.argv) > 2 else None
     data = json.loads(source.read_text(encoding="utf-8"))
     text, kept, skipped = build(data, offsets(shift_source))
+    derived = (Path(__file__).resolve().parent / "derived_parry_profiles.json")
+    text, extra = append_derived(text, derived)
     output = Path(__file__).resolve().parents[1] / "src/parry_profiles.lua"
     output.write_text(text, encoding="utf-8")
-    print(f"wrote {kept} profiles ({skipped} records without impact markers)")
+    print(f"wrote {kept} profiles ({skipped} records without impact markers, "
+          f"{extra} pose-derived)")

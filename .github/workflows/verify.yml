@@ -32,4 +32,8 @@ jobs:
           for file in main.lua src/*.lua tests/runtime/*.lua tools/diagnostics/*.lua tools/observe_parry.lua; do
             echo "Compiling $file"
             ./.luau-cli-build/luau-compile "$file" > /dev/null
-          done
+           done
+      - name: Run Luau timing and settings checks
+        run: |
+          ./.luau-cli-build/luau tests/runtime/verify_parry_math.lua tests/runtime/verify_parry_coverage.lua
+          LUAU_BIN="$PWD/.luau-cli-build/luau" python3 -m unittest discover -s tests/unit -p 'test_config_runtime.py' -v

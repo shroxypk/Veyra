@@ -2,6 +2,7 @@
 -- Candidate impact times only: not proof of parryability.
 -- `offset` is a measured scheduling shift in seconds: positive means
 -- the real impact lands before the marker, so the press moves earlier.
+-- Entries without an authored marker are pose-derived; see docs/parry.md.
 return {
  ["10017535748"]={name="Trident1",length=0.500000,hits={0.383330}},
  ["10017543126"]={name="Trident2",length=0.416660,hits={0.300000}},
@@ -168,4 +169,15 @@ return {
  ["97749185835376"]={name="Rampage",length=2.583330,hits={2.299990}},
  ["9922542154"]={name="AlkeRoar",length=4.800000,hits={1.639990}},
  ["99787918237880"]={name="Knockback",length=0.600000,hits={0.383330}},
+ ["10694823147"]={name="HeavyRapier",length=1.200000,hits={0.663000}},
+ ["11469887779"]={name="GrabLunge",length=2.400000,hits={0.230000,0.997000,1.547000}},
+ ["137057617868950"]={name="BlightSwipes",length=2.483333,hits={0.447000,1.263000,2.213000}},
+ ["138780595177276"]={name="BlightClawAnim",length=2.766667,hits={0.397000,0.797000,1.663000}},
+ ["8314692364"]={name="HammerDown",length=0.500000,hits={0.405000}},
+ ["9557400534"]={name="HeavyDagger",length=1.133333,hits={0.380000}},
+ ["9757223208"]={name="AerialKickDown",length=0.900000,hits={0.413000}},
+ ["9920866928"]={name="Right Swipe",length=1.233333,hits={0.430000}},
+ ["9920882854"]={name="Left Swipe",length=1.233333,hits={0.430000}},
+ ["9920890274"]={name="Strike",length=1.000000,hits={0.530000}},
+ ["9924282016"]={name="AlkeCombo",length=1.960000,hits={0.270000,1.070000,1.710000}},
 }

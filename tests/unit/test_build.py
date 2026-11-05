@@ -55,6 +55,27 @@ class BuildTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     builder.build(check=True)
 
+    def test_config_dependency_is_inlined(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "src"
+            src.mkdir()
+            (src / "runtime.lua").write_text(
+                'local config=loadstring(readfile("Veyra/src/config.lua"),"config.lua")()\n'
+                'loadstring(readfile("Veyra/src/minigames.lua"),"minigames.lua")()\n',
+                encoding="utf-8")
+            (src / "minigames.lua").write_text("return {}", encoding="utf-8")
+            (src / "config.lua").write_text("return {sample=true}", encoding="utf-8")
+            with patch.object(builder, "ROOT", root):
+                builder.build()
+                release = (root / "main.lua").read_text(encoding="utf-8")
+                self.assertIn("return {sample=true}", release)
+                self.assertNotIn('readfile("Veyra/src/config.lua"', release)
+                builder.build(check=True)
+                (src / "config.lua").write_text("return {sample=false}", encoding="utf-8")
+                with self.assertRaises(SystemExit):
+                    builder.build(check=True)
+
     def test_checkout_bundle_matches_sources(self):
         builder.build(check=True)
         release = (builder.ROOT / "main.lua").read_text(encoding="utf-8")
@@ -89,12 +110,16 @@ class BuildTests(unittest.TestCase):
     def test_release_has_only_retained_features(self):
         source = (builder.ROOT / "src/runtime.lua").read_text(encoding="utf-8")
         release = (builder.ROOT / "main.lua").read_text(encoding="utf-8")
-        for feature in ("Auto Minigames", "Broom Speed", "VeyraCursor", "Quest Assistance",
-                        "Boss Attack Alerts"):
+        for feature in ("Auto Minigames", "Auto Parry", "Parry Range", "Broom Speed",
+                        "VeyraCursor", "Quest Assistance", "Boss Attack Alerts",
+                        "Reset Settings", "Panic stop"):
             self.assertIn(feature, source)
             self.assertIn(feature, release)
-        self.assertIn("-- Auto Parry hidden from menu", source)
         self.assertIn("__startParry", release)
+        # Preferences are inlined, not read from the executor's disk.
+        self.assertIn("VeyraConfig", release)
+        self.assertIn("Veyra/config.json", release)
+        self.assertNotIn('readfile("Veyra/src/config.lua"', release)
         for removed in ("Auto Loot", "Auto Equip", "attack_catalog", "attack_seed", "parry_learning",
                         "attack_inference"):
             self.assertNotIn(removed, source)

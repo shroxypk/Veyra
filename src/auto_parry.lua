@@ -51,10 +51,10 @@ local state={enabled=false,alive=true,status="Parry off",profiles=profileCount,
  unknown=0,missed=0,covered=0,gated=0,learned=0,calibrated=false,bias={},hitResiduals={},
  unparryable={},unparryableSkips=0,cooldownWait=0,
  unobservedGrants=0,successByAsset={},
- unknownAssets={},log={}}
+ unknownAssets={},derived=0,log={}}
 G.VeyraParry=state
 
-local animators,watches,pending={},{},{}
+local animators,watches,pending,defensive={},{},{},{}
 local discoveryAdded,discoveryRemoved
 local seen=setmetatable({},{__mode="k"})
 local worker,packet,manager,character,healthConnection,attributeConnection
@@ -82,11 +82,206 @@ end
 if animations then
  index(animations:FindFirstChild("Server"),serverAnimations)
  for _,name in ipairs({"Hit","Blocks","Parrys"}) do index(animations:FindFirstChild(name),suitOnly) end
+ -- Reaction clips that are not under those folders but must never be read as
+ -- an incoming swing (dodges, rolls, parry poses).
+ for _,id in ipairs({"14417052527","13355016261","13355019718","8502285198",
+  "8495698342","8495708006","132555387434309","93087728991591"}) do
+  suitOnly[id]=true
+ end
 end
 
 local function log(message)
  if #state.log>=120 then table.remove(state.log,1) end
  table.insert(state.log,string.format("%.3f %s",os.clock(),message))
+end
+-- Runtime profile derivation ------------------------------------------------
+-- Many mob attacks are played from asset IDs that are not present under
+-- ReplicatedStorage.Animations, so no baked table can cover every mob. The
+-- authored hit markers are stripped from fetched KeyframeSequences, but the
+-- pose data is not: an impact lands on, or just after, the fastest pose
+-- movement of the swing. Against the 25 marker-authored profiles the probe
+-- also covers, `peak + 0.03` put 23 of 26 impacts within 0.125s (median
+-- 0.030s), which fits the 0.25s granted parry window. The three misses belong
+-- to assets that already ship an authored profile, so they never reach here.
+local HttpService=game:GetService("HttpService")
+local KeyframeSequences=game:GetService("KeyframeSequenceProvider")
+local derived={}          -- id -> {name,length,hits,derived=true}
+local deriveTried={}      -- id -> true once a fetch was attempted
+local deriveDirty=false
+local deriveSaveAt=0
+local DERIVED_PATH="Veyra/parry_derived.json"
+
+local function validProfile(profile)
+ return type(profile)=="table" and type(profile.hits)=="table" and #profile.hits>0
+  and type(profile.length)=="number" and profile.length>0 and profile.length<=30 and #profile.hits<=32
+end
+
+local function loadDerived()
+ if type(readfile)~="function" then return end
+ local ok,raw=pcall(readfile,DERIVED_PATH)
+ if not ok or type(raw)~="string" or #raw==0 or #raw>1048576 then return end
+ local okDecode,data=pcall(function() return HttpService:JSONDecode(raw) end)
+ if not okDecode or type(data)~="table" or type(data.profiles)~="table" then return end
+ local count=0
+ for id,profile in pairs(data.profiles) do
+  count+=1 if count>512 then break end
+  if type(id)=="string" and id:match("^%d+$") and validProfile(profile) then
+   local hits={}
+   for _,value in ipairs(profile.hits) do
+    if type(value)=="number" and value>=0.2 and value<=profile.length+0.05 then hits[#hits+1]=value end
+   end
+   if #hits>0 then
+    table.sort(hits)
+    derived[id]={name=type(profile.name)=="string" and profile.name or ("asset "..id),
+     length=profile.length,hits=hits,derived=true}
+   end
+  end
+ end
+end
+
+local function saveDerived()
+ if not deriveDirty or type(writefile)~="function" then return end
+ local ok,encoded=pcall(function()
+  return HttpService:JSONEncode({version=1,profiles=derived})
+ end)
+ if not ok or type(encoded)~="string" then return end
+ if type(makefolder)=="function" then pcall(makefolder,"Veyra") end
+ if pcall(writefile,DERIVED_PATH,encoded) then deriveDirty=false end
+end
+loadDerived()
+
+-- Words that identify a reaction, movement or emote rather than a swing.
+local NON_ATTACK_NAMES={"idle","walk","run","jump","fall","land","sit","emote",
+ "dance","salute","laugh","meditate","sleep","spawn","death","dead","downed",
+ "stagger","flinch","hit","parry","block","dodge","roll","equip","sheathe",
+ "draw","carry","victim","grabbed","stunned","vault","climb","swim","sing"}
+local function nameIsAttack(name)
+ local lower=string.lower(name or "")
+ if lower=="" or lower=="animation" then return true end
+ for _,word in ipairs(NON_ATTACK_NAMES) do
+  if string.find(lower,word,1,true) then return false end
+ end
+ return true
+end
+
+local function attackLike(track)
+ if track.Looped then return false end
+ local length=track.Length or 0
+ if length<0.2 or length>3.5 then return false end
+ local animation=track.Animation
+ if not animation then return false end
+ local id=animation.AnimationId:match("%d+")
+ if not id or suitOnly[id] then return false end
+ return nameIsAttack(animation.Name),id
+end
+
+-- World-space position of every pose node per keyframe, then the fastest node's
+-- speed between keyframes. Using every pose (not just R6 names) also covers
+-- custom rigs such as the lizard and mushroom bosses.
+local function poseFrames(sequence)
+ local keyframes={}
+ for _,child in ipairs(sequence:GetChildren()) do
+  if child:IsA("Keyframe") then keyframes[#keyframes+1]=child end
+ end
+ -- GetChildren order is not guaranteed to be time order; a late keyframe can be
+ -- returned last while its Time is earlier than the tail. Sort before deriving
+ -- speeds, or dt goes negative and the peak lands on the wrong frame.
+ table.sort(keyframes,function(a,b) return a.Time<b.Time end)
+ local frames,previous,previousTime={},{},nil
+ for _,keyframe in ipairs(keyframes) do
+  local current={}
+  for _,pose in ipairs(keyframe:GetDescendants()) do
+   if pose:IsA("Pose") then
+    local cframe=pose.CFrame
+    local node=pose.Parent
+    local guard=0
+    while node and node:IsA("Pose") and guard<8 do
+     cframe=node.CFrame*cframe node=node.Parent guard+=1
+    end
+    current[pose.Name]=cframe.Position
+   end
+  end
+  local speed=0
+  local dt=previousTime and (keyframe.Time-previousTime) or 0
+  if dt>0 then
+   for name,position in pairs(current) do
+    local old=previous[name]
+    if old then
+     local value=(position-old).Magnitude/dt
+     if value>speed then speed=value end
+    end
+   end
+  end
+  previous=current previousTime=keyframe.Time
+  frames[#frames+1]={t=keyframe.Time,s=speed}
+ end
+ return frames,previousTime or 0
+end
+
+local function deriveHits(frames,length)
+ local maxSpeed=0
+ for _,frame in ipairs(frames) do if frame.s>maxSpeed then maxSpeed=frame.s end end
+ if maxSpeed<6 then return nil end -- a sway, not a swing
+ local threshold=math.max(4,maxSpeed*0.15)
+ local peaks={}
+ local index=1
+ while index<=#frames do
+  if frames[index].s>=threshold then
+   local stop=index
+   while stop<=#frames and frames[stop].s>=threshold*0.5 do stop+=1 end
+   local peak=frames[index]
+   for cursor=index,stop-1 do
+    if frames[cursor].s>peak.s then peak=frames[cursor] end
+   end
+   peaks[#peaks+1]=peak.t
+   index=stop
+  else
+   index+=1
+  end
+ end
+ if #peaks==0 then return nil end
+ -- Bursts closer than 0.28s belong to one swing: a single granted parry covers
+ -- every impact inside that span, so schedule one press for the cluster centre.
+ local hits,cluster={},{peaks[1]}
+ for cursor=2,#peaks do
+  if peaks[cursor]-cluster[#cluster]<=0.28 then
+   cluster[#cluster+1]=peaks[cursor]
+  else
+   hits[#hits+1]=(cluster[1]+cluster[#cluster])/2+0.03
+   cluster={peaks[cursor]}
+  end
+ end
+ hits[#hits+1]=(cluster[1]+cluster[#cluster])/2+0.03
+ local kept={}
+ for _,hit in ipairs(hits) do
+   -- Conservative cutoff for pose-derived guesses; early authored hits still
+   -- use their original profiles and the scheduler's arrival deadline.
+  if hit>=0.2 and hit<=length+0.05 then kept[#kept+1]=hit end
+ end
+ if #kept==0 then return nil end
+ return kept
+end
+
+local function derive(id,name)
+ if derived[id]~=nil or deriveTried[id] then return derived[id] end
+ deriveTried[id]=true
+ task.spawn(function()
+  local ok,sequence=pcall(function()
+   return KeyframeSequences:GetKeyframeSequenceAsync("rbxassetid://"..id)
+  end)
+  if not ok or not sequence then return end
+  local parsed,frames,length=pcall(poseFrames,sequence)
+  sequence:Destroy()
+  if not state.alive or not parsed or #frames<2 then return end
+  local hits=deriveHits(frames,length)
+  if not hits then return end
+  derived[id]={name=name or ("asset "..id),length=length,hits=hits,derived=true}
+  deriveDirty=true
+  state.derived=(state.derived or 0)+1
+  local times={}
+  for _,hit in ipairs(hits) do times[#times+1]=string.format("%.2f",hit) end
+  log(string.format("derived %s: %d hit(s) %s",derived[id].name,#hits,table.concat(times,",")))
+ end)
 end
 local function send(action)
  if not packet then return false end
@@ -107,6 +302,7 @@ end
 local function clearCharacter()
  endSession("reset")
  table.clear(pending)
+ table.clear(defensive)
  table.clear(seen)
  activeAttempt=nil
  if healthConnection then healthConnection:Disconnect() healthConnection=nil end
@@ -186,7 +382,12 @@ local function bindCharacter(c)
      end
     end
     log(string.format("grant in %.3fs (lead %.3f)",observed,lead))
-    endSession("grant")
+    if session.holdUntil and os.clock()<session.holdUntil then
+     -- Defensive hold: keep blocking until the unprofiled swing finishes.
+     log("holding block for unprofiled swing")
+    else
+     endSession("grant")
+    end
    else
     log("grant without an active session")
    end
@@ -263,8 +464,16 @@ local function observe(model,track)
  seen[track]=true
  local id=track.Animation and track.Animation.AnimationId:match("%d+")
  if id and suitOnly[id] then return end
- local profile=id and profiles_[id]
+ local profile=id and (profiles_[id] or derived[id])
  if not profile then
+   local attack,animId=attackLike(track)
+  if attack and animId then
+   derive(animId,track.Animation.Name)
+   -- First encounter: block through the swing instead of guessing an impact.
+   -- The next play of the same asset is scheduled from the derived profile.
+   table.insert(defensive,{model=model,track=track,
+    name=track.Animation.Name or ("asset "..animId),expires=os.clock()+12})
+  end
   if id and serverAnimations[id] and not state.unknownAssets[id] then
    state.unknownAssets[id]=true state.unknown+=1 log("unsupported melee asset "..id)
   end
@@ -300,7 +509,8 @@ local function scan()
       watches[item]={connection=item.AnimationPlayed:Connect(function(track)
        -- A reused track is a new attack even if no scan saw it stop.
        seen[track]=nil
-       for i=#pending,1,-1 do if pending[i].track==track then table.remove(pending,i) end end
+        for i=#pending,1,-1 do if pending[i].track==track then table.remove(pending,i) end end
+        for i=#defensive,1,-1 do if defensive[i].track==track then table.remove(defensive,i) end end
        observe(model,track)
       end)}
      end
@@ -338,14 +548,15 @@ local function incoming(candidate,root,remaining)
  return true
 end
 
-local function startSession(now,name,calibration)
+local function startSession(now,name,calibration,holdUntil)
  local okServer,sendServer=pcall(function() return workspace:GetServerTimeNow() end)
  if not send("Block Input") then return false end
  lastSent=now
  -- Keep the session open long enough to observe the grant, then release.
+ -- A defensive session instead stays held until its swing ends.
  session={sentAt=now,sendServer=okServer and sendServer or nil,
-  deadline=now+math.min(PULSE_DEADLINE,math.max(SESSION_MIN,grantLag+0.06)),
-  calibration=calibration or nil}
+  deadline=holdUntil or (now+math.min(PULSE_DEADLINE,math.max(SESSION_MIN,grantLag+0.06))),
+  holdUntil=holdUntil,calibration=calibration or nil}
  if not calibration then
   calibrateAt=nil
   state.attempts+=1
@@ -362,6 +573,13 @@ local function step()
  local now=os.clock()
  if player.Character~=character then bindCharacter(player.Character) end
  if session and now>=session.deadline then endSession("timeout") end
+ if session and session.defensive then
+  local candidate=session.defensive
+  local root=character and character:FindFirstChild("HumanoidRootPart")
+  if not root or not candidate.track.IsPlaying or not candidate.model:IsDescendantOf(workspace)
+   or not incoming(candidate,root,0) then endSession("swing ended") end
+ end
+ if deriveDirty and now>=deriveSaveAt then deriveSaveAt=now+2 saveDerived() end
  if now>=nextScan then nextScan=now+0.4 scan() end
  local root,reason=ready()
  local available=root~=nil
@@ -392,6 +610,28 @@ local function step()
   state.status="Parry: "..reason
   if state.blockedReason~=reason then log("waiting: "..reason) end
   state.blockedReason=reason
+ end
+ if session then return end
+ -- Unprofiled swings: block through the animation on the first encounter so it
+ -- is mitigated, then the derived profile times every later play. The hold is
+ -- bounded and only starts when the attacker is actually in range.
+ for index=#defensive,1,-1 do
+  local candidate=defensive[index]
+  local track=candidate.track
+  if not candidate.model:IsDescendantOf(workspace) or not track.IsPlaying
+   or now>candidate.expires then
+   table.remove(defensive,index)
+   elseif root and now>=notBefore and now-lastSent>=PRESS_RATE and #pending==0 and track.Speed>0.01 then
+    local remaining=math.max(0,((track.Length or 0)-track.TimePosition)/track.Speed)
+   local okIn,inRange=pcall(incoming,candidate,root,remaining)
+   if okIn and inRange and remaining>0.05 then
+     if startSession(now,candidate.name,false,now+math.min(remaining+0.05,1.5)) then
+      session.defensive=candidate
+      table.remove(defensive,index)
+      break
+    end
+   end
+  end
  end
  if session then return end
  -- Measure this machine's real grant latency once, in place and with no
@@ -523,9 +763,17 @@ function state.setEnabled(on)
  discoveryRemoved=workspace.DescendantRemoving:Connect(function(item)
   if animators[item] then animators[item]=nil unwatch(item) end
  end)
- for _,item in ipairs(workspace:GetDescendants()) do
-  if item:IsA("Animator") then animators[item]=true end
- end
+  for _,name in ipairs({"FightableNPCS","NPCS"}) do
+   local folder=workspace:FindFirstChild(name)
+   if folder then
+    for index,model in ipairs(folder:GetChildren()) do
+     if index>512 then break end
+     local humanoid=model:FindFirstChildOfClass("Humanoid")
+     local animator=humanoid and humanoid:FindFirstChildOfClass("Animator")
+     if animator then animators[animator]=true end
+    end
+   end
+  end
  bindCharacter(player.Character)
  worker=RS.Heartbeat:Connect(function()
   local success,err=pcall(step)
@@ -539,6 +787,7 @@ function state.setEnabled(on)
 end
 function state.stop()
  state.setEnabled(false)
+ saveDerived()
  state.alive=false
  if G.VeyraParry==state then G.VeyraParry=nil end
 end

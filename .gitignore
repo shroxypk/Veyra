@@ -3,5 +3,6 @@
 __pycache__/
 *.pyc
 *.json
+!tools/derived_parry_profiles.json
 /fishilizer/
 /decompiled/

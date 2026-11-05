@@ -357,6 +357,169 @@ local function startModule(name,start)
   warn("Veyra: "..moduleErrors[#moduleErrors])
  end
 end
+-- Preferences load before any UI so geometry and hotkeys are right on the
+-- first frame. Only preferences are stored; every automation toggle still
+-- starts off, so a stale file can never arm a feature on its own.
+local config
+startModule("config",function() config=(function()
+-- Veyra settings store: JSON preferences with debounced, best-effort autosave.
+-- Only preferences are persisted. Every automation toggle still starts off, so
+-- a stale file can never arm a feature without a click.
+local G=getgenv()
+if G.VeyraConfig then G.VeyraConfig.stop() end
+local HttpService=game:GetService("HttpService")
+local state={alive=true,values={},dirty=false,loaded=false,path="Veyra/config.json",lastError=nil}
+G.VeyraConfig=state
+
+local function copy(value)
+ if type(value)~="table" then return value end
+ local out={}
+ for key,item in pairs(value) do out[key]=copy(item) end
+ return out
+end
+
+-- Merge saved values over defaults, keeping the default's type so a corrupted
+-- or hand-edited file cannot turn a number into a table or a string into nil.
+local function merge(defaults,saved)
+ local out={}
+ for key,default in pairs(defaults) do
+  local value
+  if type(saved)=="table" then value=saved[key] end
+  if type(default)=="table" then
+   out[key]=merge(default,type(value)=="table" and value or nil)
+  elseif value~=nil and type(value)==type(default)
+   and (type(value)~="number" or (value==value and math.abs(value)<math.huge)) then
+   out[key]=value
+  else
+   out[key]=default
+  end
+ end
+ return out
+end
+
+local scheduled=false
+function state.schedule()
+ if scheduled then return end
+ scheduled=true
+ task.delay(0.5,function()
+  scheduled=false
+  if state.alive and state.dirty then state.flush() end
+ end)
+end
+
+function state.load(defaults)
+ state.defaults=copy(defaults or {})
+ local saved=nil
+ if type(readfile)=="function" then
+  local ok,raw=pcall(readfile,state.path)
+  if ok and type(raw)=="string" and #raw>0 then
+   local decoded
+   local okDecode,result=pcall(function() return HttpService:JSONDecode(raw) end)
+   if okDecode then decoded=result end
+   if type(decoded)=="table" then
+    saved=decoded
+    state.loaded=true
+   else
+    state.lastError="config could not be parsed"
+   end
+  end
+ end
+ state.values=merge(state.defaults,saved)
+ return state.values
+end
+
+function state.get(key,fallback)
+ local value=state.values[key]
+ if value==nil then return fallback end
+ return value
+end
+
+function state.set(key,value)
+ state.values[key]=value
+ state.dirty=true
+ state.schedule()
+end
+
+function state.patch(key,partial)
+ local base=state.values[key]
+ if type(base)~="table" then
+  base={}
+  state.values[key]=base
+ end
+ for field,value in pairs(partial or {}) do base[field]=value end
+ state.dirty=true
+ state.schedule()
+end
+
+function state.flush()
+ if not state.dirty then return true end
+ if type(writefile)~="function" then
+  state.dirty=false
+  state.lastError="writefile unavailable"
+  return false
+ end
+ local ok,encoded=pcall(function() return HttpService:JSONEncode(state.values) end)
+ if not ok or type(encoded)~="string" then
+  state.lastError="config could not be encoded"
+  return false
+ end
+ if type(makefolder)=="function" then pcall(makefolder,"Veyra") end
+ local wrote=pcall(writefile,state.path,encoded)
+ state.dirty=not wrote
+ state.lastError=not wrote and "config could not be written" or nil
+ return wrote
+end
+
+function state.reset(defaults)
+ state.values=copy(defaults or state.defaults or {})
+ state.dirty=true
+ state.flush()
+ return state.values
+end
+
+function state.stop()
+ if not state.alive then return end
+ state.alive=false
+ state.flush()
+ if G.VeyraConfig==state then G.VeyraConfig=nil end
+end
+
+return state
+
+end)() end)
+if not config then
+ local function copy(value)
+  if type(value)~="table" then return value end
+  local out={} for k,v in pairs(value) do out[k]=copy(v) end return out
+ end
+ config={values={},stop=function() end}
+ function config.load(defaults) config.defaults=copy(defaults) config.values=copy(defaults) return config.values end
+ function config.reset() config.values=copy(config.defaults) return config.values end
+ function config.set(key,value) config.values[key]=value end
+ function config.patch(key,value) for k,v in pairs(value) do config.values[key][k]=v end end
+end
+local initialView=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920,1080)
+local prefs=config.load({
+ broomSpeed=1,
+ panel={x=-1,y=-1,width=math.min(430,math.max(320,initialView.X-24)),
+  height=math.min(560,math.max(420,initialView.Y-52)),preset=1},
+ hotkeys={toggle="RightControl",minimize="Delete",size="Insert",panic="End"},
+ parry={range=14},
+ quest={pins="ALL"},
+})
+H.prefs=prefs
+local usedKeys={}
+for _,entry in ipairs({{"toggle","RightControl"},{"minimize","Delete"},{"size","Insert"},{"panic","End"}}) do
+ local name=prefs.hotkeys[entry[1]]
+ local ok,key=pcall(function() return Enum.KeyCode[name] end)
+  if not ok or not key or key==Enum.KeyCode.Unknown or key==Enum.KeyCode.Escape or usedKeys[name] then
+   prefs.hotkeys={toggle="RightControl",minimize="Delete",size="Insert",panic="End"}
+   break
+  end
+ prefs.hotkeys[entry[1]]=name usedKeys[name]=true
+end
+if prefs.quest.pins~="ALL" and prefs.quest.pins~="NEAR" and prefs.quest.pins~="OFF" then prefs.quest.pins="ALL" end
+H.broomSpeed=math.clamp(tonumber(prefs.broomSpeed) or 1,1,3)
 startModule("minigames",function() __startMinigames() end)
 startModule("quest assist",function() local function __startQuestAssist()
 -- Veyra Quest Assistance: reads client-visible quest/objective data only.
@@ -1418,6 +1581,7 @@ local profiles=(function()
 -- Candidate impact times only: not proof of parryability.
 -- `offset` is a measured scheduling shift in seconds: positive means
 -- the real impact lands before the marker, so the press moves earlier.
+-- Entries without an authored marker are pose-derived; see docs/parry.md.
 return {
  ["10017535748"]={name="Trident1",length=0.500000,hits={0.383330}},
  ["10017543126"]={name="Trident2",length=0.416660,hits={0.300000}},
@@ -1584,6 +1748,17 @@ return {
  ["97749185835376"]={name="Rampage",length=2.583330,hits={2.299990}},
  ["9922542154"]={name="AlkeRoar",length=4.800000,hits={1.639990}},
  ["99787918237880"]={name="Knockback",length=0.600000,hits={0.383330}},
+ ["10694823147"]={name="HeavyRapier",length=1.200000,hits={0.663000}},
+ ["11469887779"]={name="GrabLunge",length=2.400000,hits={0.230000,0.997000,1.547000}},
+ ["137057617868950"]={name="BlightSwipes",length=2.483333,hits={0.447000,1.263000,2.213000}},
+ ["138780595177276"]={name="BlightClawAnim",length=2.766667,hits={0.397000,0.797000,1.663000}},
+ ["8314692364"]={name="HammerDown",length=0.500000,hits={0.405000}},
+ ["9557400534"]={name="HeavyDagger",length=1.133333,hits={0.380000}},
+ ["9757223208"]={name="AerialKickDown",length=0.900000,hits={0.413000}},
+ ["9920866928"]={name="Right Swipe",length=1.233333,hits={0.430000}},
+ ["9920882854"]={name="Left Swipe",length=1.233333,hits={0.430000}},
+ ["9920890274"]={name="Strike",length=1.000000,hits={0.530000}},
+ ["9924282016"]={name="AlkeCombo",length=1.960000,hits={0.270000,1.070000,1.710000}},
 }
 
 end)()
@@ -1926,6 +2101,7 @@ local profiles=(function()
 -- Candidate impact times only: not proof of parryability.
 -- `offset` is a measured scheduling shift in seconds: positive means
 -- the real impact lands before the marker, so the press moves earlier.
+-- Entries without an authored marker are pose-derived; see docs/parry.md.
 return {
  ["10017535748"]={name="Trident1",length=0.500000,hits={0.383330}},
  ["10017543126"]={name="Trident2",length=0.416660,hits={0.300000}},
@@ -2092,6 +2268,17 @@ return {
  ["97749185835376"]={name="Rampage",length=2.583330,hits={2.299990}},
  ["9922542154"]={name="AlkeRoar",length=4.800000,hits={1.639990}},
  ["99787918237880"]={name="Knockback",length=0.600000,hits={0.383330}},
+ ["10694823147"]={name="HeavyRapier",length=1.200000,hits={0.663000}},
+ ["11469887779"]={name="GrabLunge",length=2.400000,hits={0.230000,0.997000,1.547000}},
+ ["137057617868950"]={name="BlightSwipes",length=2.483333,hits={0.447000,1.263000,2.213000}},
+ ["138780595177276"]={name="BlightClawAnim",length=2.766667,hits={0.397000,0.797000,1.663000}},
+ ["8314692364"]={name="HammerDown",length=0.500000,hits={0.405000}},
+ ["9557400534"]={name="HeavyDagger",length=1.133333,hits={0.380000}},
+ ["9757223208"]={name="AerialKickDown",length=0.900000,hits={0.413000}},
+ ["9920866928"]={name="Right Swipe",length=1.233333,hits={0.430000}},
+ ["9920882854"]={name="Left Swipe",length=1.233333,hits={0.430000}},
+ ["9920890274"]={name="Strike",length=1.000000,hits={0.530000}},
+ ["9924282016"]={name="AlkeCombo",length=1.960000,hits={0.270000,1.070000,1.710000}},
 }
 
 end)()
@@ -2176,10 +2363,10 @@ local state={enabled=false,alive=true,status="Parry off",profiles=profileCount,
  unknown=0,missed=0,covered=0,gated=0,learned=0,calibrated=false,bias={},hitResiduals={},
  unparryable={},unparryableSkips=0,cooldownWait=0,
  unobservedGrants=0,successByAsset={},
- unknownAssets={},log={}}
+ unknownAssets={},derived=0,log={}}
 G.VeyraParry=state
 
-local animators,watches,pending={},{},{}
+local animators,watches,pending,defensive={},{},{},{}
 local discoveryAdded,discoveryRemoved
 local seen=setmetatable({},{__mode="k"})
 local worker,packet,manager,character,healthConnection,attributeConnection
@@ -2207,11 +2394,206 @@ end
 if animations then
  index(animations:FindFirstChild("Server"),serverAnimations)
  for _,name in ipairs({"Hit","Blocks","Parrys"}) do index(animations:FindFirstChild(name),suitOnly) end
+ -- Reaction clips that are not under those folders but must never be read as
+ -- an incoming swing (dodges, rolls, parry poses).
+ for _,id in ipairs({"14417052527","13355016261","13355019718","8502285198",
+  "8495698342","8495708006","132555387434309","93087728991591"}) do
+  suitOnly[id]=true
+ end
 end
 
 local function log(message)
  if #state.log>=120 then table.remove(state.log,1) end
  table.insert(state.log,string.format("%.3f %s",os.clock(),message))
+end
+-- Runtime profile derivation ------------------------------------------------
+-- Many mob attacks are played from asset IDs that are not present under
+-- ReplicatedStorage.Animations, so no baked table can cover every mob. The
+-- authored hit markers are stripped from fetched KeyframeSequences, but the
+-- pose data is not: an impact lands on, or just after, the fastest pose
+-- movement of the swing. Against the 25 marker-authored profiles the probe
+-- also covers, `peak + 0.03` put 23 of 26 impacts within 0.125s (median
+-- 0.030s), which fits the 0.25s granted parry window. The three misses belong
+-- to assets that already ship an authored profile, so they never reach here.
+local HttpService=game:GetService("HttpService")
+local KeyframeSequences=game:GetService("KeyframeSequenceProvider")
+local derived={}          -- id -> {name,length,hits,derived=true}
+local deriveTried={}      -- id -> true once a fetch was attempted
+local deriveDirty=false
+local deriveSaveAt=0
+local DERIVED_PATH="Veyra/parry_derived.json"
+
+local function validProfile(profile)
+ return type(profile)=="table" and type(profile.hits)=="table" and #profile.hits>0
+  and type(profile.length)=="number" and profile.length>0 and profile.length<=30 and #profile.hits<=32
+end
+
+local function loadDerived()
+ if type(readfile)~="function" then return end
+ local ok,raw=pcall(readfile,DERIVED_PATH)
+ if not ok or type(raw)~="string" or #raw==0 or #raw>1048576 then return end
+ local okDecode,data=pcall(function() return HttpService:JSONDecode(raw) end)
+ if not okDecode or type(data)~="table" or type(data.profiles)~="table" then return end
+ local count=0
+ for id,profile in pairs(data.profiles) do
+  count+=1 if count>512 then break end
+  if type(id)=="string" and id:match("^%d+$") and validProfile(profile) then
+   local hits={}
+   for _,value in ipairs(profile.hits) do
+    if type(value)=="number" and value>=0.2 and value<=profile.length+0.05 then hits[#hits+1]=value end
+   end
+   if #hits>0 then
+    table.sort(hits)
+    derived[id]={name=type(profile.name)=="string" and profile.name or ("asset "..id),
+     length=profile.length,hits=hits,derived=true}
+   end
+  end
+ end
+end
+
+local function saveDerived()
+ if not deriveDirty or type(writefile)~="function" then return end
+ local ok,encoded=pcall(function()
+  return HttpService:JSONEncode({version=1,profiles=derived})
+ end)
+ if not ok or type(encoded)~="string" then return end
+ if type(makefolder)=="function" then pcall(makefolder,"Veyra") end
+ if pcall(writefile,DERIVED_PATH,encoded) then deriveDirty=false end
+end
+loadDerived()
+
+-- Words that identify a reaction, movement or emote rather than a swing.
+local NON_ATTACK_NAMES={"idle","walk","run","jump","fall","land","sit","emote",
+ "dance","salute","laugh","meditate","sleep","spawn","death","dead","downed",
+ "stagger","flinch","hit","parry","block","dodge","roll","equip","sheathe",
+ "draw","carry","victim","grabbed","stunned","vault","climb","swim","sing"}
+local function nameIsAttack(name)
+ local lower=string.lower(name or "")
+ if lower=="" or lower=="animation" then return true end
+ for _,word in ipairs(NON_ATTACK_NAMES) do
+  if string.find(lower,word,1,true) then return false end
+ end
+ return true
+end
+
+local function attackLike(track)
+ if track.Looped then return false end
+ local length=track.Length or 0
+ if length<0.2 or length>3.5 then return false end
+ local animation=track.Animation
+ if not animation then return false end
+ local id=animation.AnimationId:match("%d+")
+ if not id or suitOnly[id] then return false end
+ return nameIsAttack(animation.Name),id
+end
+
+-- World-space position of every pose node per keyframe, then the fastest node's
+-- speed between keyframes. Using every pose (not just R6 names) also covers
+-- custom rigs such as the lizard and mushroom bosses.
+local function poseFrames(sequence)
+ local keyframes={}
+ for _,child in ipairs(sequence:GetChildren()) do
+  if child:IsA("Keyframe") then keyframes[#keyframes+1]=child end
+ end
+ -- GetChildren order is not guaranteed to be time order; a late keyframe can be
+ -- returned last while its Time is earlier than the tail. Sort before deriving
+ -- speeds, or dt goes negative and the peak lands on the wrong frame.
+ table.sort(keyframes,function(a,b) return a.Time<b.Time end)
+ local frames,previous,previousTime={},{},nil
+ for _,keyframe in ipairs(keyframes) do
+  local current={}
+  for _,pose in ipairs(keyframe:GetDescendants()) do
+   if pose:IsA("Pose") then
+    local cframe=pose.CFrame
+    local node=pose.Parent
+    local guard=0
+    while node and node:IsA("Pose") and guard<8 do
+     cframe=node.CFrame*cframe node=node.Parent guard+=1
+    end
+    current[pose.Name]=cframe.Position
+   end
+  end
+  local speed=0
+  local dt=previousTime and (keyframe.Time-previousTime) or 0
+  if dt>0 then
+   for name,position in pairs(current) do
+    local old=previous[name]
+    if old then
+     local value=(position-old).Magnitude/dt
+     if value>speed then speed=value end
+    end
+   end
+  end
+  previous=current previousTime=keyframe.Time
+  frames[#frames+1]={t=keyframe.Time,s=speed}
+ end
+ return frames,previousTime or 0
+end
+
+local function deriveHits(frames,length)
+ local maxSpeed=0
+ for _,frame in ipairs(frames) do if frame.s>maxSpeed then maxSpeed=frame.s end end
+ if maxSpeed<6 then return nil end -- a sway, not a swing
+ local threshold=math.max(4,maxSpeed*0.15)
+ local peaks={}
+ local index=1
+ while index<=#frames do
+  if frames[index].s>=threshold then
+   local stop=index
+   while stop<=#frames and frames[stop].s>=threshold*0.5 do stop+=1 end
+   local peak=frames[index]
+   for cursor=index,stop-1 do
+    if frames[cursor].s>peak.s then peak=frames[cursor] end
+   end
+   peaks[#peaks+1]=peak.t
+   index=stop
+  else
+   index+=1
+  end
+ end
+ if #peaks==0 then return nil end
+ -- Bursts closer than 0.28s belong to one swing: a single granted parry covers
+ -- every impact inside that span, so schedule one press for the cluster centre.
+ local hits,cluster={},{peaks[1]}
+ for cursor=2,#peaks do
+  if peaks[cursor]-cluster[#cluster]<=0.28 then
+   cluster[#cluster+1]=peaks[cursor]
+  else
+   hits[#hits+1]=(cluster[1]+cluster[#cluster])/2+0.03
+   cluster={peaks[cursor]}
+  end
+ end
+ hits[#hits+1]=(cluster[1]+cluster[#cluster])/2+0.03
+ local kept={}
+ for _,hit in ipairs(hits) do
+   -- Conservative cutoff for pose-derived guesses; early authored hits still
+   -- use their original profiles and the scheduler's arrival deadline.
+  if hit>=0.2 and hit<=length+0.05 then kept[#kept+1]=hit end
+ end
+ if #kept==0 then return nil end
+ return kept
+end
+
+local function derive(id,name)
+ if derived[id]~=nil or deriveTried[id] then return derived[id] end
+ deriveTried[id]=true
+ task.spawn(function()
+  local ok,sequence=pcall(function()
+   return KeyframeSequences:GetKeyframeSequenceAsync("rbxassetid://"..id)
+  end)
+  if not ok or not sequence then return end
+  local parsed,frames,length=pcall(poseFrames,sequence)
+  sequence:Destroy()
+  if not state.alive or not parsed or #frames<2 then return end
+  local hits=deriveHits(frames,length)
+  if not hits then return end
+  derived[id]={name=name or ("asset "..id),length=length,hits=hits,derived=true}
+  deriveDirty=true
+  state.derived=(state.derived or 0)+1
+  local times={}
+  for _,hit in ipairs(hits) do times[#times+1]=string.format("%.2f",hit) end
+  log(string.format("derived %s: %d hit(s) %s",derived[id].name,#hits,table.concat(times,",")))
+ end)
 end
 local function send(action)
  if not packet then return false end
@@ -2232,6 +2614,7 @@ end
 local function clearCharacter()
  endSession("reset")
  table.clear(pending)
+ table.clear(defensive)
  table.clear(seen)
  activeAttempt=nil
  if healthConnection then healthConnection:Disconnect() healthConnection=nil end
@@ -2311,7 +2694,12 @@ local function bindCharacter(c)
      end
     end
     log(string.format("grant in %.3fs (lead %.3f)",observed,lead))
-    endSession("grant")
+    if session.holdUntil and os.clock()<session.holdUntil then
+     -- Defensive hold: keep blocking until the unprofiled swing finishes.
+     log("holding block for unprofiled swing")
+    else
+     endSession("grant")
+    end
    else
     log("grant without an active session")
    end
@@ -2388,8 +2776,16 @@ local function observe(model,track)
  seen[track]=true
  local id=track.Animation and track.Animation.AnimationId:match("%d+")
  if id and suitOnly[id] then return end
- local profile=id and profiles_[id]
+ local profile=id and (profiles_[id] or derived[id])
  if not profile then
+   local attack,animId=attackLike(track)
+  if attack and animId then
+   derive(animId,track.Animation.Name)
+   -- First encounter: block through the swing instead of guessing an impact.
+   -- The next play of the same asset is scheduled from the derived profile.
+   table.insert(defensive,{model=model,track=track,
+    name=track.Animation.Name or ("asset "..animId),expires=os.clock()+12})
+  end
   if id and serverAnimations[id] and not state.unknownAssets[id] then
    state.unknownAssets[id]=true state.unknown+=1 log("unsupported melee asset "..id)
   end
@@ -2425,7 +2821,8 @@ local function scan()
       watches[item]={connection=item.AnimationPlayed:Connect(function(track)
        -- A reused track is a new attack even if no scan saw it stop.
        seen[track]=nil
-       for i=#pending,1,-1 do if pending[i].track==track then table.remove(pending,i) end end
+        for i=#pending,1,-1 do if pending[i].track==track then table.remove(pending,i) end end
+        for i=#defensive,1,-1 do if defensive[i].track==track then table.remove(defensive,i) end end
        observe(model,track)
       end)}
      end
@@ -2463,14 +2860,15 @@ local function incoming(candidate,root,remaining)
  return true
 end
 
-local function startSession(now,name,calibration)
+local function startSession(now,name,calibration,holdUntil)
  local okServer,sendServer=pcall(function() return workspace:GetServerTimeNow() end)
  if not send("Block Input") then return false end
  lastSent=now
  -- Keep the session open long enough to observe the grant, then release.
+ -- A defensive session instead stays held until its swing ends.
  session={sentAt=now,sendServer=okServer and sendServer or nil,
-  deadline=now+math.min(PULSE_DEADLINE,math.max(SESSION_MIN,grantLag+0.06)),
-  calibration=calibration or nil}
+  deadline=holdUntil or (now+math.min(PULSE_DEADLINE,math.max(SESSION_MIN,grantLag+0.06))),
+  holdUntil=holdUntil,calibration=calibration or nil}
  if not calibration then
   calibrateAt=nil
   state.attempts+=1
@@ -2487,6 +2885,13 @@ local function step()
  local now=os.clock()
  if player.Character~=character then bindCharacter(player.Character) end
  if session and now>=session.deadline then endSession("timeout") end
+ if session and session.defensive then
+  local candidate=session.defensive
+  local root=character and character:FindFirstChild("HumanoidRootPart")
+  if not root or not candidate.track.IsPlaying or not candidate.model:IsDescendantOf(workspace)
+   or not incoming(candidate,root,0) then endSession("swing ended") end
+ end
+ if deriveDirty and now>=deriveSaveAt then deriveSaveAt=now+2 saveDerived() end
  if now>=nextScan then nextScan=now+0.4 scan() end
  local root,reason=ready()
  local available=root~=nil
@@ -2517,6 +2922,28 @@ local function step()
   state.status="Parry: "..reason
   if state.blockedReason~=reason then log("waiting: "..reason) end
   state.blockedReason=reason
+ end
+ if session then return end
+ -- Unprofiled swings: block through the animation on the first encounter so it
+ -- is mitigated, then the derived profile times every later play. The hold is
+ -- bounded and only starts when the attacker is actually in range.
+ for index=#defensive,1,-1 do
+  local candidate=defensive[index]
+  local track=candidate.track
+  if not candidate.model:IsDescendantOf(workspace) or not track.IsPlaying
+   or now>candidate.expires then
+   table.remove(defensive,index)
+   elseif root and now>=notBefore and now-lastSent>=PRESS_RATE and #pending==0 and track.Speed>0.01 then
+    local remaining=math.max(0,((track.Length or 0)-track.TimePosition)/track.Speed)
+   local okIn,inRange=pcall(incoming,candidate,root,remaining)
+   if okIn and inRange and remaining>0.05 then
+     if startSession(now,candidate.name,false,now+math.min(remaining+0.05,1.5)) then
+      session.defensive=candidate
+      table.remove(defensive,index)
+      break
+    end
+   end
+  end
  end
  if session then return end
  -- Measure this machine's real grant latency once, in place and with no
@@ -2648,9 +3075,17 @@ function state.setEnabled(on)
  discoveryRemoved=workspace.DescendantRemoving:Connect(function(item)
   if animators[item] then animators[item]=nil unwatch(item) end
  end)
- for _,item in ipairs(workspace:GetDescendants()) do
-  if item:IsA("Animator") then animators[item]=true end
- end
+  for _,name in ipairs({"FightableNPCS","NPCS"}) do
+   local folder=workspace:FindFirstChild(name)
+   if folder then
+    for index,model in ipairs(folder:GetChildren()) do
+     if index>512 then break end
+     local humanoid=model:FindFirstChildOfClass("Humanoid")
+     local animator=humanoid and humanoid:FindFirstChildOfClass("Animator")
+     if animator then animators[animator]=true end
+    end
+   end
+  end
  bindCharacter(player.Character)
  worker=RS.Heartbeat:Connect(function()
   local success,err=pcall(step)
@@ -2664,6 +3099,7 @@ function state.setEnabled(on)
 end
 function state.stop()
  state.setEnabled(false)
+ saveDerived()
  state.alive=false
  if G.VeyraParry==state then G.VeyraParry=nil end
 end
@@ -2677,6 +3113,9 @@ H.parry=AP
 local QA = G.VeyraQuestAssist
 local BA = G.VeyraBossAlerts
 local MG = G.VeyraMinigames
+-- Restore the preferences the modules own, before their first frame.
+if AP then AP.range=math.clamp(tonumber(prefs.parry.range) or 14,6,30) end
+if QA and prefs.quest.pins then QA.markerMode=prefs.quest.pins end
 H.questAssist=QA
 H.bossAlerts=BA
 H.minigames=MG
@@ -2805,12 +3244,48 @@ end
 -- Event callbacks can access PlayerGui without gethui's Plugin capability.
 local gui=new("ScreenGui",{Name="VeyraPanel",ResetOnSpawn=false,IgnoreGuiInset=true,DisplayOrder=10000,ZIndexBehavior=Enum.ZIndexBehavior.Sibling},player.PlayerGui)
 H.gui=gui
-local initialView=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920,1080)
-local size=Vector2.new(math.min(430,math.max(320,initialView.X-24)),math.min(560,math.max(420,initialView.Y-52)))
+-- Toasts: short, self-dismissing notices anchored to the top-right corner.
+-- CanvasGroup gives one property to fade, so the card and its text disappear
+-- together instead of popping off the screen.
+local toastHost=new("Frame",{Name="Toasts",AnchorPoint=Vector2.new(1,0),Position=UDim2.new(1,-16,0,16),Size=UDim2.fromOffset(264,0),BackgroundTransparency=1,BorderSizePixel=0},gui)
+new("UIListLayout",{Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder,HorizontalAlignment=Enum.HorizontalAlignment.Right},toastHost)
+local toasts={}
+local function dismissToast(card)
+ if H.tweens[card] then H.tweens[card]:Cancel() H.tweens[card]=nil end
+ for index,entry in ipairs(toasts) do
+  if entry==card then table.remove(toasts,index) break end
+ end
+ if card.Parent then card:Destroy() end
+end
+local function toast(title,text)
+ if not H.alive or not gui.Parent then return end
+ while #toasts>=3 do dismissToast(toasts[1]) end
+ local card=new("CanvasGroup",{Size=UDim2.fromOffset(264,52),BackgroundColor3=palette.panel,BorderSizePixel=0,GroupTransparency=0},toastHost)
+ corner(card,10)
+ new("UIStroke",{Color=palette.line,Thickness=1,Transparency=0.2},card)
+ new("Frame",{Name="AccentBar",Position=UDim2.fromOffset(0,11),Size=UDim2.fromOffset(3,30),BackgroundColor3=palette.accent,BorderSizePixel=0},card)
+ new("TextLabel",{Position=UDim2.fromOffset(14,8),Size=UDim2.new(1,-24,0,18),BackgroundTransparency=1,Text=title,Font=Enum.Font.GothamBold,TextSize=13,TextColor3=palette.text,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},card)
+ new("TextLabel",{Position=UDim2.fromOffset(14,27),Size=UDim2.new(1,-24,0,16),BackgroundTransparency=1,Text=text,Font=Enum.Font.Gotham,TextSize=11,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},card)
+ table.insert(toasts,card)
+ task.delay(3.4,function()
+  if not card.Parent then return end
+  tween(card,{GroupTransparency=1})
+  task.delay(0.2,function() dismissToast(card) end)
+ end)
+ return card
+end
+H.toast=toast
+local size=Vector2.new(
+ math.clamp(tonumber(prefs.panel.width) or 430,320,math.max(320,math.min(680,initialView.X-16))),
+ math.clamp(tonumber(prefs.panel.height) or 560,420,math.max(420,math.min(860,initialView.Y-40))))
+local savedX=tonumber(prefs.panel.x) or -1
+local savedY=tonumber(prefs.panel.y) or -1
+local startX=savedX>=0 and savedX or math.max(8,math.min(35,initialView.X-size.X-8))
+local startY=savedY>=0 and savedY or math.max(8,math.min(120,initialView.Y-size.Y-8))
 local HEADER=66
 local BODY_TOP=70
 local BOTTOM=72
-local frame=new("Frame",{Name="Main",Size=UDim2.fromOffset(size.X,size.Y),Position=UDim2.fromOffset(math.max(8,math.min(35,initialView.X-size.X-8)),math.max(8,math.min(120,initialView.Y-size.Y-8))),BackgroundColor3=palette.bg,BorderSizePixel=0,ClipsDescendants=true,Active=true},gui)
+local frame=new("Frame",{Name="Main",Size=UDim2.fromOffset(size.X,size.Y),Position=UDim2.fromOffset(math.clamp(startX,0,math.max(0,initialView.X-size.X)),math.clamp(startY,0,math.max(0,initialView.Y-size.Y))),BackgroundColor3=palette.bg,BorderSizePixel=0,ClipsDescendants=true,Active=true},gui)
 corner(frame,16)
 new("UIStroke",{Color=palette.line,Thickness=1,Transparency=0.25},frame)
 local header=new("TextButton",{Name="DragHeader",Size=UDim2.new(1,-50,0,HEADER),BackgroundTransparency=1,Text="",AutoButtonColor=false},frame)
@@ -2905,24 +3380,108 @@ local function stepper(name,description,minValue,maxValue,step,initial,format,ca
  button("-","Minus",-76)
  button("+","Plus",-40)
  paint()
- return b
+ return b,function(nextValue) value=nextValue paint() end
+end
+-- One row for a plain action, with a right-aligned value the caller can
+-- repaint (used for hotkey bindings and the reset button).
+local function action(name,description,initialText,callback)
+ order+=1
+ local b=new("TextButton",{Name=name,LayoutOrder=order,Size=UDim2.new(1,-5,0,58),BackgroundColor3=palette.panel,BorderSizePixel=0,Text="",AutoButtonColor=false},body)
+ corner(b,10)
+ local pad=iconChip(b,8)
+ new("TextLabel",{Position=UDim2.fromOffset(12+pad,9),Size=UDim2.new(1,-142-pad,0,20),BackgroundTransparency=1,Text=name,Font=Enum.Font.GothamMedium,TextSize=14,TextColor3=palette.text,TextXAlignment=Enum.TextXAlignment.Left},b)
+ new("TextLabel",{Position=UDim2.fromOffset(12+pad,32),Size=UDim2.new(1,-142-pad,0,16),BackgroundTransparency=1,Text=description,Font=Enum.Font.Gotham,TextSize=12,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},b)
+ local value=new("TextLabel",{Name="Value",Position=UDim2.new(1,-118,0.5,-12),Size=UDim2.fromOffset(106,24),BackgroundTransparency=1,Text=initialText,Font=Enum.Font.GothamBold,TextSize=12,TextColor3=palette.accent,TextXAlignment=Enum.TextXAlignment.Right,TextTruncate=Enum.TextTruncate.AtEnd},b)
+ connect(b.Activated,function() callback(value) end)
+ connect(b.MouseEnter,function() tween(b,{BackgroundColor3=hover}) end)
+ connect(b.MouseLeave,function() tween(b,{BackgroundColor3=palette.panel}) end)
+ return b,value
+end
+-- Rebindable hotkeys: a row per action, click it, press a key. Bindings are
+-- stored by KeyCode name so a saved file stays readable and portable.
+local hotkeyRows={}
+local bindingAction
+local updateFooter
+local function keyLabel(name)
+ return (tostring(name or "?"):gsub("(%l)(%u)","%1 %2"):upper())
+end
+local function applyHotkey(actionKey,name)
+ for key,value in pairs(prefs.hotkeys) do
+  if key~=actionKey and value==name then
+   hotkeyRows[actionKey].Text=keyLabel(prefs.hotkeys[actionKey])
+   toast("Key already bound","Choose a different key")
+   return false
+  end
+ end
+ prefs.hotkeys[actionKey]=name
+ config.set("hotkeys",prefs.hotkeys)
+ local row=hotkeyRows[actionKey]
+ if row then row.Text=keyLabel(name) end
+ if updateFooter then updateFooter() end
+ return true
+end
+local function bindHotkey(actionKey,valueLabel)
+ if bindingAction then hotkeyRows[bindingAction].Text=keyLabel(prefs.hotkeys[bindingAction]) end
+ bindingAction=actionKey
+ valueLabel.Text="PRESS A KEY"
+ toast("Rebind "..actionKey,"Any key binds · Esc cancels")
 end
 heading("Automation")
 toggle("Auto Minigames","Solves every harvest + mining minigame for you",false,
  function(on) if MG then MG.setEnabled(on) end end,
  function() return MG and MG.enabled end)
--- Auto Parry hidden from menu (experimental, not fully reliable)
--- toggle("Auto Parry","Experimental melee timing · equip weapon",false,function(on) if AP then AP.setEnabled(on) end end,function() return AP and AP.enabled end)
+toggle("Auto Parry","Predicts mob impact from animation poses · equip a melee weapon",false,
+ function(on) if AP then AP.setEnabled(on) end end,
+ function() return AP and AP.enabled end)
+local _,resetRange=stepper("Parry Range","Only react to attackers inside this distance",6,30,1,
+ math.clamp(tonumber(prefs.parry.range) or 14,6,30),
+ function(v) return string.format("%.0f studs",v) end,
+ function(v) if AP then AP.range=v end config.set("parry",{range=v}) end)
 heading("Guidance")
 toggle("Quest Assistance","Draggable tracker · progress · marker controls",false,
  function(on) if QA then QA.setEnabled(on) end end,function() return QA and QA.enabled end)
 toggle("Boss Attack Alerts","Adaptive cues for profiled boss windups",false,function(on) if BA then BA.setEnabled(on) end end,function() return BA and BA.enabled end)
 heading("Movement")
-stepper("Broom Speed","Flight velocity multiplier · 1 = normal",1,3,0.25,1,
+local _,resetBroom=stepper("Broom Speed","Flight velocity multiplier · 1 = normal",1,3,0.25,
+ math.clamp(tonumber(prefs.broomSpeed) or 1,1,3),
  function(v) return string.format("%.2fx",v) end,
- function(v) H.broomSpeed=v armBroom() end)
+ function(v) H.broomSpeed=v armBroom() config.set("broomSpeed",v) end)
+heading("Controls")
+for _,entry in ipairs({
+ {key="toggle",label="Open / close panel",description="Show or hide the hub"},
+ {key="minimize",label="Minimize panel",description="Collapse to the title bar"},
+ {key="size",label="Cycle panel size",description="Step through the size presets"},
+ {key="panic",label="Panic stop",description="Disable every automation at once"},
+}) do
+ local _,value=action(entry.label,entry.description,keyLabel(prefs.hotkeys[entry.key]),
+  function(label) bindHotkey(entry.key,label) end)
+ hotkeyRows[entry.key]=value
+end
+local resetGeometry
+action("Reset Settings","Forget saved geometry, hotkeys and ranges","RESET",function()
+ config.reset()
+ prefs=config.values
+ H.prefs=prefs
+ resetRange(prefs.parry.range)
+ resetBroom(prefs.broomSpeed)
+ bindingAction=nil
+ if resetGeometry then resetGeometry() end
+ H.broomSpeed=math.clamp(tonumber(prefs.broomSpeed) or 1,1,3)
+ if AP then AP.range=math.clamp(tonumber(prefs.parry.range) or 14,6,30) end
+ if QA and prefs.quest.pins then QA.markerMode=prefs.quest.pins end
+ for actionKey,row in pairs(hotkeyRows) do row.Text=keyLabel(prefs.hotkeys[actionKey]) end
+ armBroom()
+ if updateFooter then updateFooter() end
+ toast("Settings reset","Default preferences restored")
+end)
 local status=new("TextLabel",{Name="Status",Position=UDim2.new(0,20,1,-54),Size=UDim2.new(1,-134,0,20),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=12,TextColor3=palette.accent,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,Text="Minigames off"},frame)
-local footer=new("TextLabel",{Position=UDim2.new(0,20,1,-32),Size=UDim2.new(1,-70,0,18),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=11,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left,Text="RightCtrl: hide · Delete: minimize · Insert: size"},frame)
+local footer=new("TextLabel",{Position=UDim2.new(0,20,1,-32),Size=UDim2.new(1,-70,0,18),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=11,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},frame)
+function updateFooter()
+ footer.Text=string.format("%s hide · %s min · %s size · %s stop",
+  keyLabel(prefs.hotkeys.toggle),keyLabel(prefs.hotkeys.minimize),
+  keyLabel(prefs.hotkeys.size),keyLabel(prefs.hotkeys.panic))
+end
+updateFooter()
 local unload=new("TextButton",{Position=UDim2.new(1,-102,1,-58),Size=UDim2.fromOffset(82,30),BackgroundColor3=Color3.fromRGB(36,18,20),BorderSizePixel=0,Text="Unload",Font=Enum.Font.GothamMedium,TextSize=12,TextColor3=palette.accent},frame)
 corner(unload,8)
 new("UIStroke",{Color=palette.accentDim,Thickness=1,Transparency=0.35},unload)
@@ -2937,7 +3496,14 @@ local edgeR=new("TextButton",{Name="ResizeRight",Position=UDim2.new(1,-5,0,0),Si
 local edgeB=new("TextButton",{Name="ResizeBottom",Position=UDim2.new(0,0,1,-5),Size=UDim2.new(1,-24,0,5),BackgroundTransparency=1,Text="",AutoButtonColor=false},frame)
 local drag,resize,startMouse,startPos,startSize,dragTouch
 local sizePresets={Vector2.new(430,560),Vector2.new(500,620),Vector2.new(580,700)}
-local presetIndex=1
+local presetIndex=math.clamp(math.floor(tonumber(prefs.panel.preset) or 1),1,#sizePresets)
+-- Geometry is written on gesture end, never per frame: a drag would otherwise
+-- queue a save on every mouse-move.
+local function savePanel()
+ local position=frame.AbsolutePosition
+ config.patch("panel",{x=math.floor(position.X+0.5),y=math.floor(position.Y+0.5),
+  width=math.floor(size.X+0.5),height=math.floor(size.Y+0.5),preset=presetIndex})
+end
 local function setMinimized(state)
  minimized=state
  bodyHost.Visible=not minimized status.Visible=not minimized footer.Visible=not minimized unload.Visible=not minimized
@@ -2955,6 +3521,13 @@ local function cycleSize()
   math.clamp(position.Y,8,math.max(8,view.Y-(minimized and HEADER or size.Y)-8)))
  layoutPages()
  if not minimized then tween(frame,{Size=UDim2.fromOffset(size.X,size.Y)}) end
+ savePanel()
+end
+resetGeometry=function()
+ presetIndex=1
+ size=Vector2.new(prefs.panel.width,prefs.panel.height)
+ frame.Position=UDim2.fromOffset(math.max(0,math.min(35,initialView.X-size.X)),math.max(0,math.min(120,initialView.Y-size.Y)))
+ setMinimized(false)
 end
 local function begin(input,mode)
  if minimized and mode=="resize" then return end
@@ -2996,7 +3569,9 @@ connect(UIS.InputChanged,function(i)
 end)
 connect(UIS.InputEnded,function(i)
  if (dragTouch and i==dragTouch) or (not dragTouch and i.UserInputType==Enum.UserInputType.MouseButton1) then
+  local changed=drag or resize
   drag=false resize=false dragTouch=nil
+  if changed then savePanel() end
  end
 end)
 connect(minimize.Activated,function() setMinimized(not minimized) end)
@@ -3017,6 +3592,7 @@ local function refreshStatus()
  for _,refresh in ipairs(toggleRefresh) do refresh() end
  local label="Ready · features disabled"
  if BA and BA.enabled then label=BA.status end
+ if AP and AP.enabled then label=AP.status end
  if QA and QA.enabled then
   label=QA.selected and ("Quest: "..QA.selected..(QA.distance and (" · "..QA.distance.." studs") or "")) or QA.status
  end
@@ -3028,6 +3604,12 @@ local function refreshStatus()
  if BA and BA.enabled and BA.status:find("Boss marker",1,true) then label=BA.status end
  if #moduleErrors>0 then label="Module issue · "..moduleErrors[1] end
  if status.Text~=label then status.Text=label end
+ -- The tracker's own PINS button is the only place marker mode changes, so
+ -- mirror it into preferences instead of adding a second control for it.
+ if QA and QA.markerMode and QA.markerMode~=prefs.quest.pins then
+  prefs.quest.pins=QA.markerMode
+  config.patch("quest",{pins=QA.markerMode})
+ end
 end
 local function cursorFree()
  -- A locked mouse means gameplay owns the pointer. The panel must never take
@@ -3035,9 +3617,14 @@ local function cursorFree()
  -- treat the cursor as free and drop character movement.
  return UIS.MouseBehavior~=Enum.MouseBehavior.LockCenter
 end
+local nextPanel=0
 local function updatePanel()
  local now=os.clock()
  if now>=nextStatus then nextStatus=now+0.5 refreshStatus() end
+ -- Hover hit-testing does not need every render frame; the drag path still
+ -- runs each frame so resizing and dragging stay smooth.
+ if not drag and not resize and now<nextPanel then return end
+ nextPanel=now+0.022
  local mouse=UIS:GetMouseLocation()
  local p,s=frame.AbsolutePosition,frame.AbsoluteSize
  local free=cursorFree()
@@ -3079,33 +3666,99 @@ local function showPanel(enabled)
   cursorRelease()
  end
 end
+-- Panic stop: one key disables every automation, including a parry session
+-- that is mid-swing, without unloading the hub or touching the character.
+local function disableAll(reason)
+ for _,module in pairs({MG,QA,BA,AP}) do
+  if module and module.setEnabled then pcall(module.setEnabled,false) end
+ end
+ H.broomSpeed=1
+ resetBroom(1)
+ armBroom()
+ config.set("broomSpeed",1)
+ refreshStatus()
+ toast("Panic stop",reason or "All automation disabled")
+end
+H.panic=disableAll
 local function handleHubKeys(i,processed)
- if processed or not H.alive then return end
- if i.KeyCode==Enum.KeyCode.RightControl then
+ if not H.alive then return end
+ local code=i.KeyCode
+ -- A pending rebind consumes the next key, even one the game also uses.
+ if bindingAction then
+  if i.UserInputType==Enum.UserInputType.Keyboard and code then
+   local target=bindingAction
+   bindingAction=nil
+   local row=hotkeyRows[target]
+   if code==Enum.KeyCode.Escape then
+    if row then row.Text=keyLabel(prefs.hotkeys[target]) end
+    toast("Rebind cancelled","Kept "..keyLabel(prefs.hotkeys[target]))
+   else
+    if code~=Enum.KeyCode.Unknown and applyHotkey(target,code.Name) then
+     toast("Hotkey bound",target.." · "..keyLabel(code.Name))
+    end
+   end
+  end
+  return
+ end
+ if processed or UIS:GetFocusedTextBox() then return end
+ if code==Enum.KeyCode[prefs.hotkeys.toggle] then
   showPanel(not gui.Enabled)
- elseif i.KeyCode==Enum.KeyCode.Delete then
+ elseif code==Enum.KeyCode[prefs.hotkeys.minimize] then
   setMinimized(not minimized)
- elseif i.KeyCode==Enum.KeyCode.Insert then
+ elseif code==Enum.KeyCode[prefs.hotkeys.size] then
   cycleSize()
+ elseif code==Enum.KeyCode[prefs.hotkeys.panic] then
+  disableAll()
  end
 end
 connect(UIS.InputBegan,handleHubKeys)
 H.testKeybind=handleHubKeys
 H.isCursorActive=function() return cursorBound end
+-- Low-health warning: one toast per life, re-armed once health recovers, so a
+-- long fight cannot spam the corner.
+local healthConnection,healthWarned
+local function watchHealth(character)
+ if healthConnection then healthConnection:Disconnect() healthConnection=nil end
+ healthWarned=false
+ local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+ if not humanoid then return end
+ healthConnection=humanoid.HealthChanged:Connect(function(value)
+  local maximum=humanoid.MaxHealth
+  if maximum<=0 then return end
+  local ratio=value/maximum
+  if ratio<=0.3 and value>0 and not healthWarned then
+   healthWarned=true
+   toast("Low health",string.format("%.0f / %.0f · disengage",value,maximum))
+  elseif ratio>0.5 then
+   healthWarned=false
+  end
+ end)
+end
+H.testHealth=watchHealth
 wireBroomCharacter(player.Character)
-connect(player.CharacterAdded,function(char) task.defer(wireBroomCharacter,char) end)
+watchHealth(player.Character)
+connect(player.CharacterAdded,function(char)
+ task.defer(function()
+  if not H.alive or char~=player.Character then return end
+  wireBroomCharacter(char)
+  watchHealth(char)
+ end)
+end)
 function H.unload()
  if not H.alive then return end
  H.alive=false
  broomGeneration+=1
  if mountConnection then mountConnection:Disconnect() mountConnection=nil end
  if broomScaler then broomScaler:Disconnect() broomScaler=nil end
+ if healthConnection then healthConnection:Disconnect() healthConnection=nil end
  detachBroomVelocity()
+ savePanel()
  showPanel(false)
  if MG and MG.stop then MG.stop() end
  if QA and QA.stop then QA.stop() end
  if BA and BA.stop then BA.stop() end
  if AP and AP.stop then AP.stop() end
+ if config and config.stop then config.stop() end
  for _,c in ipairs(H.connections) do c:Disconnect() end
  table.clear(H.connections)
  for _,t in pairs(H.tweens) do t:Cancel() end

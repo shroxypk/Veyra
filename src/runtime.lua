@@ -43,6 +43,44 @@ local function startModule(name,start)
   warn("Veyra: "..moduleErrors[#moduleErrors])
  end
 end
+-- Preferences load before any UI so geometry and hotkeys are right on the
+-- first frame. Only preferences are stored; every automation toggle still
+-- starts off, so a stale file can never arm a feature on its own.
+local config
+startModule("config",function() config=loadstring(readfile("Veyra/src/config.lua"),"config.lua")() end)
+if not config then
+ local function copy(value)
+  if type(value)~="table" then return value end
+  local out={} for k,v in pairs(value) do out[k]=copy(v) end return out
+ end
+ config={values={},stop=function() end}
+ function config.load(defaults) config.defaults=copy(defaults) config.values=copy(defaults) return config.values end
+ function config.reset() config.values=copy(config.defaults) return config.values end
+ function config.set(key,value) config.values[key]=value end
+ function config.patch(key,value) for k,v in pairs(value) do config.values[key][k]=v end end
+end
+local initialView=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920,1080)
+local prefs=config.load({
+ broomSpeed=1,
+ panel={x=-1,y=-1,width=math.min(430,math.max(320,initialView.X-24)),
+  height=math.min(560,math.max(420,initialView.Y-52)),preset=1},
+ hotkeys={toggle="RightControl",minimize="Delete",size="Insert",panic="End"},
+ parry={range=14},
+ quest={pins="ALL"},
+})
+H.prefs=prefs
+local usedKeys={}
+for _,entry in ipairs({{"toggle","RightControl"},{"minimize","Delete"},{"size","Insert"},{"panic","End"}}) do
+ local name=prefs.hotkeys[entry[1]]
+ local ok,key=pcall(function() return Enum.KeyCode[name] end)
+  if not ok or not key or key==Enum.KeyCode.Unknown or key==Enum.KeyCode.Escape or usedKeys[name] then
+   prefs.hotkeys={toggle="RightControl",minimize="Delete",size="Insert",panic="End"}
+   break
+  end
+ prefs.hotkeys[entry[1]]=name usedKeys[name]=true
+end
+if prefs.quest.pins~="ALL" and prefs.quest.pins~="NEAR" and prefs.quest.pins~="OFF" then prefs.quest.pins="ALL" end
+H.broomSpeed=math.clamp(tonumber(prefs.broomSpeed) or 1,1,3)
 startModule("minigames",function() loadstring(readfile("Veyra/src/minigames.lua"),"minigames.lua")() end)
 startModule("quest assist",function() loadstring(readfile("Veyra/src/quest_assist.lua"),"quest_assist.lua")() end)
 startModule("boss alerts",function() loadstring(readfile("Veyra/src/boss_alerts.lua"),"boss_alerts.lua")() end)
@@ -52,6 +90,9 @@ H.parry=AP
 local QA = G.VeyraQuestAssist
 local BA = G.VeyraBossAlerts
 local MG = G.VeyraMinigames
+-- Restore the preferences the modules own, before their first frame.
+if AP then AP.range=math.clamp(tonumber(prefs.parry.range) or 14,6,30) end
+if QA and prefs.quest.pins then QA.markerMode=prefs.quest.pins end
 H.questAssist=QA
 H.bossAlerts=BA
 H.minigames=MG
@@ -180,12 +221,48 @@ end
 -- Event callbacks can access PlayerGui without gethui's Plugin capability.
 local gui=new("ScreenGui",{Name="VeyraPanel",ResetOnSpawn=false,IgnoreGuiInset=true,DisplayOrder=10000,ZIndexBehavior=Enum.ZIndexBehavior.Sibling},player.PlayerGui)
 H.gui=gui
-local initialView=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920,1080)
-local size=Vector2.new(math.min(430,math.max(320,initialView.X-24)),math.min(560,math.max(420,initialView.Y-52)))
+-- Toasts: short, self-dismissing notices anchored to the top-right corner.
+-- CanvasGroup gives one property to fade, so the card and its text disappear
+-- together instead of popping off the screen.
+local toastHost=new("Frame",{Name="Toasts",AnchorPoint=Vector2.new(1,0),Position=UDim2.new(1,-16,0,16),Size=UDim2.fromOffset(264,0),BackgroundTransparency=1,BorderSizePixel=0},gui)
+new("UIListLayout",{Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder,HorizontalAlignment=Enum.HorizontalAlignment.Right},toastHost)
+local toasts={}
+local function dismissToast(card)
+ if H.tweens[card] then H.tweens[card]:Cancel() H.tweens[card]=nil end
+ for index,entry in ipairs(toasts) do
+  if entry==card then table.remove(toasts,index) break end
+ end
+ if card.Parent then card:Destroy() end
+end
+local function toast(title,text)
+ if not H.alive or not gui.Parent then return end
+ while #toasts>=3 do dismissToast(toasts[1]) end
+ local card=new("CanvasGroup",{Size=UDim2.fromOffset(264,52),BackgroundColor3=palette.panel,BorderSizePixel=0,GroupTransparency=0},toastHost)
+ corner(card,10)
+ new("UIStroke",{Color=palette.line,Thickness=1,Transparency=0.2},card)
+ new("Frame",{Name="AccentBar",Position=UDim2.fromOffset(0,11),Size=UDim2.fromOffset(3,30),BackgroundColor3=palette.accent,BorderSizePixel=0},card)
+ new("TextLabel",{Position=UDim2.fromOffset(14,8),Size=UDim2.new(1,-24,0,18),BackgroundTransparency=1,Text=title,Font=Enum.Font.GothamBold,TextSize=13,TextColor3=palette.text,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},card)
+ new("TextLabel",{Position=UDim2.fromOffset(14,27),Size=UDim2.new(1,-24,0,16),BackgroundTransparency=1,Text=text,Font=Enum.Font.Gotham,TextSize=11,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},card)
+ table.insert(toasts,card)
+ task.delay(3.4,function()
+  if not card.Parent then return end
+  tween(card,{GroupTransparency=1})
+  task.delay(0.2,function() dismissToast(card) end)
+ end)
+ return card
+end
+H.toast=toast
+local size=Vector2.new(
+ math.clamp(tonumber(prefs.panel.width) or 430,320,math.max(320,math.min(680,initialView.X-16))),
+ math.clamp(tonumber(prefs.panel.height) or 560,420,math.max(420,math.min(860,initialView.Y-40))))
+local savedX=tonumber(prefs.panel.x) or -1
+local savedY=tonumber(prefs.panel.y) or -1
+local startX=savedX>=0 and savedX or math.max(8,math.min(35,initialView.X-size.X-8))
+local startY=savedY>=0 and savedY or math.max(8,math.min(120,initialView.Y-size.Y-8))
 local HEADER=66
 local BODY_TOP=70
 local BOTTOM=72
-local frame=new("Frame",{Name="Main",Size=UDim2.fromOffset(size.X,size.Y),Position=UDim2.fromOffset(math.max(8,math.min(35,initialView.X-size.X-8)),math.max(8,math.min(120,initialView.Y-size.Y-8))),BackgroundColor3=palette.bg,BorderSizePixel=0,ClipsDescendants=true,Active=true},gui)
+local frame=new("Frame",{Name="Main",Size=UDim2.fromOffset(size.X,size.Y),Position=UDim2.fromOffset(math.clamp(startX,0,math.max(0,initialView.X-size.X)),math.clamp(startY,0,math.max(0,initialView.Y-size.Y))),BackgroundColor3=palette.bg,BorderSizePixel=0,ClipsDescendants=true,Active=true},gui)
 corner(frame,16)
 new("UIStroke",{Color=palette.line,Thickness=1,Transparency=0.25},frame)
 local header=new("TextButton",{Name="DragHeader",Size=UDim2.new(1,-50,0,HEADER),BackgroundTransparency=1,Text="",AutoButtonColor=false},frame)
@@ -280,24 +357,108 @@ local function stepper(name,description,minValue,maxValue,step,initial,format,ca
  button("-","Minus",-76)
  button("+","Plus",-40)
  paint()
- return b
+ return b,function(nextValue) value=nextValue paint() end
+end
+-- One row for a plain action, with a right-aligned value the caller can
+-- repaint (used for hotkey bindings and the reset button).
+local function action(name,description,initialText,callback)
+ order+=1
+ local b=new("TextButton",{Name=name,LayoutOrder=order,Size=UDim2.new(1,-5,0,58),BackgroundColor3=palette.panel,BorderSizePixel=0,Text="",AutoButtonColor=false},body)
+ corner(b,10)
+ local pad=iconChip(b,8)
+ new("TextLabel",{Position=UDim2.fromOffset(12+pad,9),Size=UDim2.new(1,-142-pad,0,20),BackgroundTransparency=1,Text=name,Font=Enum.Font.GothamMedium,TextSize=14,TextColor3=palette.text,TextXAlignment=Enum.TextXAlignment.Left},b)
+ new("TextLabel",{Position=UDim2.fromOffset(12+pad,32),Size=UDim2.new(1,-142-pad,0,16),BackgroundTransparency=1,Text=description,Font=Enum.Font.Gotham,TextSize=12,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},b)
+ local value=new("TextLabel",{Name="Value",Position=UDim2.new(1,-118,0.5,-12),Size=UDim2.fromOffset(106,24),BackgroundTransparency=1,Text=initialText,Font=Enum.Font.GothamBold,TextSize=12,TextColor3=palette.accent,TextXAlignment=Enum.TextXAlignment.Right,TextTruncate=Enum.TextTruncate.AtEnd},b)
+ connect(b.Activated,function() callback(value) end)
+ connect(b.MouseEnter,function() tween(b,{BackgroundColor3=hover}) end)
+ connect(b.MouseLeave,function() tween(b,{BackgroundColor3=palette.panel}) end)
+ return b,value
+end
+-- Rebindable hotkeys: a row per action, click it, press a key. Bindings are
+-- stored by KeyCode name so a saved file stays readable and portable.
+local hotkeyRows={}
+local bindingAction
+local updateFooter
+local function keyLabel(name)
+ return (tostring(name or "?"):gsub("(%l)(%u)","%1 %2"):upper())
+end
+local function applyHotkey(actionKey,name)
+ for key,value in pairs(prefs.hotkeys) do
+  if key~=actionKey and value==name then
+   hotkeyRows[actionKey].Text=keyLabel(prefs.hotkeys[actionKey])
+   toast("Key already bound","Choose a different key")
+   return false
+  end
+ end
+ prefs.hotkeys[actionKey]=name
+ config.set("hotkeys",prefs.hotkeys)
+ local row=hotkeyRows[actionKey]
+ if row then row.Text=keyLabel(name) end
+ if updateFooter then updateFooter() end
+ return true
+end
+local function bindHotkey(actionKey,valueLabel)
+ if bindingAction then hotkeyRows[bindingAction].Text=keyLabel(prefs.hotkeys[bindingAction]) end
+ bindingAction=actionKey
+ valueLabel.Text="PRESS A KEY"
+ toast("Rebind "..actionKey,"Any key binds · Esc cancels")
 end
 heading("Automation")
 toggle("Auto Minigames","Solves every harvest + mining minigame for you",false,
  function(on) if MG then MG.setEnabled(on) end end,
  function() return MG and MG.enabled end)
--- Auto Parry hidden from menu (experimental, not fully reliable)
--- toggle("Auto Parry","Experimental melee timing · equip weapon",false,function(on) if AP then AP.setEnabled(on) end end,function() return AP and AP.enabled end)
+toggle("Auto Parry","Predicts mob impact from animation poses · equip a melee weapon",false,
+ function(on) if AP then AP.setEnabled(on) end end,
+ function() return AP and AP.enabled end)
+local _,resetRange=stepper("Parry Range","Only react to attackers inside this distance",6,30,1,
+ math.clamp(tonumber(prefs.parry.range) or 14,6,30),
+ function(v) return string.format("%.0f studs",v) end,
+ function(v) if AP then AP.range=v end config.set("parry",{range=v}) end)
 heading("Guidance")
 toggle("Quest Assistance","Draggable tracker · progress · marker controls",false,
  function(on) if QA then QA.setEnabled(on) end end,function() return QA and QA.enabled end)
 toggle("Boss Attack Alerts","Adaptive cues for profiled boss windups",false,function(on) if BA then BA.setEnabled(on) end end,function() return BA and BA.enabled end)
 heading("Movement")
-stepper("Broom Speed","Flight velocity multiplier · 1 = normal",1,3,0.25,1,
+local _,resetBroom=stepper("Broom Speed","Flight velocity multiplier · 1 = normal",1,3,0.25,
+ math.clamp(tonumber(prefs.broomSpeed) or 1,1,3),
  function(v) return string.format("%.2fx",v) end,
- function(v) H.broomSpeed=v armBroom() end)
+ function(v) H.broomSpeed=v armBroom() config.set("broomSpeed",v) end)
+heading("Controls")
+for _,entry in ipairs({
+ {key="toggle",label="Open / close panel",description="Show or hide the hub"},
+ {key="minimize",label="Minimize panel",description="Collapse to the title bar"},
+ {key="size",label="Cycle panel size",description="Step through the size presets"},
+ {key="panic",label="Panic stop",description="Disable every automation at once"},
+}) do
+ local _,value=action(entry.label,entry.description,keyLabel(prefs.hotkeys[entry.key]),
+  function(label) bindHotkey(entry.key,label) end)
+ hotkeyRows[entry.key]=value
+end
+local resetGeometry
+action("Reset Settings","Forget saved geometry, hotkeys and ranges","RESET",function()
+ config.reset()
+ prefs=config.values
+ H.prefs=prefs
+ resetRange(prefs.parry.range)
+ resetBroom(prefs.broomSpeed)
+ bindingAction=nil
+ if resetGeometry then resetGeometry() end
+ H.broomSpeed=math.clamp(tonumber(prefs.broomSpeed) or 1,1,3)
+ if AP then AP.range=math.clamp(tonumber(prefs.parry.range) or 14,6,30) end
+ if QA and prefs.quest.pins then QA.markerMode=prefs.quest.pins end
+ for actionKey,row in pairs(hotkeyRows) do row.Text=keyLabel(prefs.hotkeys[actionKey]) end
+ armBroom()
+ if updateFooter then updateFooter() end
+ toast("Settings reset","Default preferences restored")
+end)
 local status=new("TextLabel",{Name="Status",Position=UDim2.new(0,20,1,-54),Size=UDim2.new(1,-134,0,20),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=12,TextColor3=palette.accent,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,Text="Minigames off"},frame)
-local footer=new("TextLabel",{Position=UDim2.new(0,20,1,-32),Size=UDim2.new(1,-70,0,18),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=11,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left,Text="RightCtrl: hide · Delete: minimize · Insert: size"},frame)
+local footer=new("TextLabel",{Position=UDim2.new(0,20,1,-32),Size=UDim2.new(1,-70,0,18),BackgroundTransparency=1,Font=Enum.Font.Gotham,TextSize=11,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd},frame)
+function updateFooter()
+ footer.Text=string.format("%s hide · %s min · %s size · %s stop",
+  keyLabel(prefs.hotkeys.toggle),keyLabel(prefs.hotkeys.minimize),
+  keyLabel(prefs.hotkeys.size),keyLabel(prefs.hotkeys.panic))
+end
+updateFooter()
 local unload=new("TextButton",{Position=UDim2.new(1,-102,1,-58),Size=UDim2.fromOffset(82,30),BackgroundColor3=Color3.fromRGB(36,18,20),BorderSizePixel=0,Text="Unload",Font=Enum.Font.GothamMedium,TextSize=12,TextColor3=palette.accent},frame)
 corner(unload,8)
 new("UIStroke",{Color=palette.accentDim,Thickness=1,Transparency=0.35},unload)
@@ -312,7 +473,14 @@ local edgeR=new("TextButton",{Name="ResizeRight",Position=UDim2.new(1,-5,0,0),Si
 local edgeB=new("TextButton",{Name="ResizeBottom",Position=UDim2.new(0,0,1,-5),Size=UDim2.new(1,-24,0,5),BackgroundTransparency=1,Text="",AutoButtonColor=false},frame)
 local drag,resize,startMouse,startPos,startSize,dragTouch
 local sizePresets={Vector2.new(430,560),Vector2.new(500,620),Vector2.new(580,700)}
-local presetIndex=1
+local presetIndex=math.clamp(math.floor(tonumber(prefs.panel.preset) or 1),1,#sizePresets)
+-- Geometry is written on gesture end, never per frame: a drag would otherwise
+-- queue a save on every mouse-move.
+local function savePanel()
+ local position=frame.AbsolutePosition
+ config.patch("panel",{x=math.floor(position.X+0.5),y=math.floor(position.Y+0.5),
+  width=math.floor(size.X+0.5),height=math.floor(size.Y+0.5),preset=presetIndex})
+end
 local function setMinimized(state)
  minimized=state
  bodyHost.Visible=not minimized status.Visible=not minimized footer.Visible=not minimized unload.Visible=not minimized
@@ -330,6 +498,13 @@ local function cycleSize()
   math.clamp(position.Y,8,math.max(8,view.Y-(minimized and HEADER or size.Y)-8)))
  layoutPages()
  if not minimized then tween(frame,{Size=UDim2.fromOffset(size.X,size.Y)}) end
+ savePanel()
+end
+resetGeometry=function()
+ presetIndex=1
+ size=Vector2.new(prefs.panel.width,prefs.panel.height)
+ frame.Position=UDim2.fromOffset(math.max(0,math.min(35,initialView.X-size.X)),math.max(0,math.min(120,initialView.Y-size.Y)))
+ setMinimized(false)
 end
 local function begin(input,mode)
  if minimized and mode=="resize" then return end
@@ -371,7 +546,9 @@ connect(UIS.InputChanged,function(i)
 end)
 connect(UIS.InputEnded,function(i)
  if (dragTouch and i==dragTouch) or (not dragTouch and i.UserInputType==Enum.UserInputType.MouseButton1) then
+  local changed=drag or resize
   drag=false resize=false dragTouch=nil
+  if changed then savePanel() end
  end
 end)
 connect(minimize.Activated,function() setMinimized(not minimized) end)
@@ -392,6 +569,7 @@ local function refreshStatus()
  for _,refresh in ipairs(toggleRefresh) do refresh() end
  local label="Ready · features disabled"
  if BA and BA.enabled then label=BA.status end
+ if AP and AP.enabled then label=AP.status end
  if QA and QA.enabled then
   label=QA.selected and ("Quest: "..QA.selected..(QA.distance and (" · "..QA.distance.." studs") or "")) or QA.status
  end
@@ -403,6 +581,12 @@ local function refreshStatus()
  if BA and BA.enabled and BA.status:find("Boss marker",1,true) then label=BA.status end
  if #moduleErrors>0 then label="Module issue · "..moduleErrors[1] end
  if status.Text~=label then status.Text=label end
+ -- The tracker's own PINS button is the only place marker mode changes, so
+ -- mirror it into preferences instead of adding a second control for it.
+ if QA and QA.markerMode and QA.markerMode~=prefs.quest.pins then
+  prefs.quest.pins=QA.markerMode
+  config.patch("quest",{pins=QA.markerMode})
+ end
 end
 local function cursorFree()
  -- A locked mouse means gameplay owns the pointer. The panel must never take
@@ -410,9 +594,14 @@ local function cursorFree()
  -- treat the cursor as free and drop character movement.
  return UIS.MouseBehavior~=Enum.MouseBehavior.LockCenter
 end
+local nextPanel=0
 local function updatePanel()
  local now=os.clock()
  if now>=nextStatus then nextStatus=now+0.5 refreshStatus() end
+ -- Hover hit-testing does not need every render frame; the drag path still
+ -- runs each frame so resizing and dragging stay smooth.
+ if not drag and not resize and now<nextPanel then return end
+ nextPanel=now+0.022
  local mouse=UIS:GetMouseLocation()
  local p,s=frame.AbsolutePosition,frame.AbsoluteSize
  local free=cursorFree()
@@ -454,33 +643,99 @@ local function showPanel(enabled)
   cursorRelease()
  end
 end
+-- Panic stop: one key disables every automation, including a parry session
+-- that is mid-swing, without unloading the hub or touching the character.
+local function disableAll(reason)
+ for _,module in pairs({MG,QA,BA,AP}) do
+  if module and module.setEnabled then pcall(module.setEnabled,false) end
+ end
+ H.broomSpeed=1
+ resetBroom(1)
+ armBroom()
+ config.set("broomSpeed",1)
+ refreshStatus()
+ toast("Panic stop",reason or "All automation disabled")
+end
+H.panic=disableAll
 local function handleHubKeys(i,processed)
- if processed or not H.alive then return end
- if i.KeyCode==Enum.KeyCode.RightControl then
+ if not H.alive then return end
+ local code=i.KeyCode
+ -- A pending rebind consumes the next key, even one the game also uses.
+ if bindingAction then
+  if i.UserInputType==Enum.UserInputType.Keyboard and code then
+   local target=bindingAction
+   bindingAction=nil
+   local row=hotkeyRows[target]
+   if code==Enum.KeyCode.Escape then
+    if row then row.Text=keyLabel(prefs.hotkeys[target]) end
+    toast("Rebind cancelled","Kept "..keyLabel(prefs.hotkeys[target]))
+   else
+    if code~=Enum.KeyCode.Unknown and applyHotkey(target,code.Name) then
+     toast("Hotkey bound",target.." · "..keyLabel(code.Name))
+    end
+   end
+  end
+  return
+ end
+ if processed or UIS:GetFocusedTextBox() then return end
+ if code==Enum.KeyCode[prefs.hotkeys.toggle] then
   showPanel(not gui.Enabled)
- elseif i.KeyCode==Enum.KeyCode.Delete then
+ elseif code==Enum.KeyCode[prefs.hotkeys.minimize] then
   setMinimized(not minimized)
- elseif i.KeyCode==Enum.KeyCode.Insert then
+ elseif code==Enum.KeyCode[prefs.hotkeys.size] then
   cycleSize()
+ elseif code==Enum.KeyCode[prefs.hotkeys.panic] then
+  disableAll()
  end
 end
 connect(UIS.InputBegan,handleHubKeys)
 H.testKeybind=handleHubKeys
 H.isCursorActive=function() return cursorBound end
+-- Low-health warning: one toast per life, re-armed once health recovers, so a
+-- long fight cannot spam the corner.
+local healthConnection,healthWarned
+local function watchHealth(character)
+ if healthConnection then healthConnection:Disconnect() healthConnection=nil end
+ healthWarned=false
+ local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+ if not humanoid then return end
+ healthConnection=humanoid.HealthChanged:Connect(function(value)
+  local maximum=humanoid.MaxHealth
+  if maximum<=0 then return end
+  local ratio=value/maximum
+  if ratio<=0.3 and value>0 and not healthWarned then
+   healthWarned=true
+   toast("Low health",string.format("%.0f / %.0f · disengage",value,maximum))
+  elseif ratio>0.5 then
+   healthWarned=false
+  end
+ end)
+end
+H.testHealth=watchHealth
 wireBroomCharacter(player.Character)
-connect(player.CharacterAdded,function(char) task.defer(wireBroomCharacter,char) end)
+watchHealth(player.Character)
+connect(player.CharacterAdded,function(char)
+ task.defer(function()
+  if not H.alive or char~=player.Character then return end
+  wireBroomCharacter(char)
+  watchHealth(char)
+ end)
+end)
 function H.unload()
  if not H.alive then return end
  H.alive=false
  broomGeneration+=1
  if mountConnection then mountConnection:Disconnect() mountConnection=nil end
  if broomScaler then broomScaler:Disconnect() broomScaler=nil end
+ if healthConnection then healthConnection:Disconnect() healthConnection=nil end
  detachBroomVelocity()
+ savePanel()
  showPanel(false)
  if MG and MG.stop then MG.stop() end
  if QA and QA.stop then QA.stop() end
  if BA and BA.stop then BA.stop() end
  if AP and AP.stop then AP.stop() end
+ if config and config.stop then config.stop() end
  for _,c in ipairs(H.connections) do c:Disconnect() end
  table.clear(H.connections)
  for _,t in pairs(H.tweens) do t:Cancel() end

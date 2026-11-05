@@ -1,0 +1,91 @@
+{
+ "_comment": "Pose-derived mob attack profiles: impact = fastest pose movement + 0.03s. See docs/parry.md.",
+ "profiles": {
+  "10694823147": {
+   "hits": [
+    0.663
+   ],
+   "length": 1.2,
+   "name": "HeavyRapier"
+  },
+  "11469887779": {
+   "hits": [
+    0.23,
+    0.997,
+    1.547
+   ],
+   "length": 2.4,
+   "name": "GrabLunge"
+  },
+  "137057617868950": {
+   "hits": [
+    0.447,
+    1.263,
+    2.213
+   ],
+   "length": 2.483333,
+   "name": "BlightSwipes"
+  },
+  "138780595177276": {
+   "hits": [
+    0.397,
+    0.797,
+    1.663
+   ],
+   "length": 2.766667,
+   "name": "BlightClawAnim"
+  },
+  "8314692364": {
+   "hits": [
+    0.405
+   ],
+   "length": 0.5,
+   "name": "HammerDown"
+  },
+  "9557400534": {
+   "hits": [
+    0.38
+   ],
+   "length": 1.133333,
+   "name": "HeavyDagger"
+  },
+  "9757223208": {
+   "hits": [
+    0.413
+   ],
+   "length": 0.9,
+   "name": "AerialKickDown"
+  },
+  "9920866928": {
+   "hits": [
+    0.43
+   ],
+   "length": 1.233333,
+   "name": "Right Swipe"
+  },
+  "9920882854": {
+   "hits": [
+    0.43
+   ],
+   "length": 1.233333,
+   "name": "Left Swipe"
+  },
+  "9920890274": {
+   "hits": [
+    0.53
+   ],
+   "length": 1.0,
+   "name": "Strike"
+  },
+  "9924282016": {
+   "hits": [
+    0.27,
+    1.07,
+    1.71
+   ],
+   "length": 1.96,
+   "name": "AlkeCombo"
+  }
+ },
+ "version": 1
+}
