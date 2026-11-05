@@ -1,6 +1,13 @@
 {
  "_comment": "Pose-derived mob attack profiles: impact = fastest pose movement + 0.03s. See docs/parry.md.",
  "profiles": {
+  "10028752861": {
+   "hits": [
+    0.513
+   ],
+   "length": 0.65,
+   "name": "KamoGuardAnimation2"
+  },
   "10694823147": {
    "hits": [
     0.663
@@ -16,6 +23,13 @@
    ],
    "length": 2.4,
    "name": "GrabLunge"
+  },
+  "124023674688709": {
+   "hits": [
+    1.33
+   ],
+   "length": 1.4,
+   "name": "WolfAnimation"
   },
   "137057617868950": {
    "hits": [
@@ -55,6 +69,21 @@
    ],
    "length": 0.9,
    "name": "AerialKickDown"
+  },
+  "9839859772": {
+   "hits": [
+    0.261,
+    0.822
+   ],
+   "length": 1.077083,
+   "name": "KamoGuardAnimation"
+  },
+  "9839879425": {
+   "hits": [
+    0.397
+   ],
+   "length": 0.65,
+   "name": "BanditAnimation"
   },
   "9920866928": {
    "hits": [
