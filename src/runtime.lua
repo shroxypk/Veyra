@@ -5,6 +5,7 @@ if G.VeyraMinigames then G.VeyraMinigames.stop() end
 if G.VeyraQuestAssist then G.VeyraQuestAssist.stop() end
 if G.VeyraParry then G.VeyraParry.stop() end
 if G.VeyraBossAlerts then G.VeyraBossAlerts.stop() end
+if G.VeyraGather then G.VeyraGather.stop() end
   -- Legacy guard: builds before v2 kept a Kill Aura module here. Reloading the
   -- hub must release its held mouse button, or it keeps swinging on its own.
   if G.VeyraKillAura and G.VeyraKillAura.stop then G.VeyraKillAura.stop() end
@@ -85,6 +86,9 @@ startModule("minigames",function() loadstring(readfile("Veyra/src/minigames.lua"
 startModule("quest assist",function() loadstring(readfile("Veyra/src/quest_assist.lua"),"quest_assist.lua")() end)
 startModule("boss alerts",function() loadstring(readfile("Veyra/src/boss_alerts.lua"),"boss_alerts.lua")() end)
 startModule("auto parry",function() loadstring(readfile("Veyra/src/auto_parry.lua"),"auto_parry.lua")() end)
+startModule("gathering",function() loadstring(readfile("Veyra/src/gather.lua"),"gather.lua")() end)
+local GA=G.VeyraGather
+H.gather=GA
 local AP = G.VeyraParry
 H.parry=AP
 local QA = G.VeyraQuestAssist
@@ -271,12 +275,33 @@ new("TextLabel",{Position=UDim2.fromOffset(34,10),Size=UDim2.new(1,-50,0,26),Bac
 new("TextLabel",{Position=UDim2.fromOffset(34,38),Size=UDim2.new(1,-50,0,16),BackgroundTransparency=1,Text="CLOVER RPG · AUTOMATION",Font=Enum.Font.Gotham,TextSize=10,TextColor3=palette.muted,TextXAlignment=Enum.TextXAlignment.Left},header)
 local minimize=new("TextButton",{Name="Minimize",Position=UDim2.new(1,-52,0,16),Size=UDim2.fromOffset(36,36),BackgroundColor3=palette.panel,Text="-",TextSize=24,Font=Enum.Font.Gotham,TextColor3=palette.text,BorderSizePixel=0},frame)
 corner(minimize,9)
--- All controls share one scrollable list.
+-- Each feature group owns its scroll position; changing tabs only changes UI.
 local minimized=false
 local order=0
 local bodyHost=new("Frame",{Name="Body",Position=UDim2.fromOffset(14,BODY_TOP),Size=UDim2.new(1,-28,0,382),BackgroundTransparency=1,BorderSizePixel=0},frame)
-local body=new("ScrollingFrame",{Name="Features",Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,ScrollBarImageColor3=palette.line,CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollingDirection=Enum.ScrollingDirection.Y,ElasticBehavior=Enum.ElasticBehavior.Never},bodyHost)
-new("UIListLayout",{Padding=UDim.new(0,9),SortOrder=Enum.SortOrder.LayoutOrder},body)
+local tabBar=new("Frame",{Name="Tabs",Size=UDim2.new(1,0,0,34),BackgroundTransparency=1},bodyHost)
+local pages,tabButtons={},{}
+local body
+local function selectTab(name)
+ if not pages[name] then return end
+ H.activeTab=name
+ for pageName,page in pairs(pages) do
+  local selected=pageName==name
+  page.Visible=selected
+  tabButtons[pageName].BackgroundColor3=selected and palette.accent or palette.panel
+  tabButtons[pageName].TextColor3=selected and palette.onAccent or palette.muted
+ end
+end
+for index,name in ipairs({"Combat","Gathering","Movement","Guidance","Settings"}) do
+ local page=new("ScrollingFrame",{Name=name,Position=UDim2.fromOffset(0,44),Size=UDim2.new(1,0,1,-44),Visible=false,BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,ScrollBarImageColor3=palette.line,CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollingDirection=Enum.ScrollingDirection.Y,ElasticBehavior=Enum.ElasticBehavior.Never},bodyHost)
+ new("UIListLayout",{Padding=UDim.new(0,9),SortOrder=Enum.SortOrder.LayoutOrder},page)
+ local button=new("TextButton",{Name=name,Position=UDim2.new((index-1)/5,2,0,0),Size=UDim2.new(1/5,-4,1,0),BackgroundColor3=palette.panel,BorderSizePixel=0,Text=name,Font=Enum.Font.GothamMedium,TextSize=10,TextColor3=palette.muted,AutoButtonColor=false},tabBar)
+ corner(button,7)
+ pages[name]=page tabButtons[name]=button
+ connect(button.Activated,function() selectTab(name) end)
+end
+H.selectTab=selectTab
+selectTab("Combat")
 local function layoutPages()
  local height=math.max(140,(minimized and HEADER or size.Y)-BODY_TOP-BOTTOM)
  bodyHost.Size=UDim2.new(1,-28,0,height)
@@ -403,10 +428,13 @@ local function bindHotkey(actionKey,valueLabel)
  valueLabel.Text="PRESS A KEY"
  toast("Rebind "..actionKey,"Any key binds · Esc cancels")
 end
-heading("Automation")
+body=pages.Gathering
+heading("Minigames")
 toggle("Auto Minigames","Solves every harvest + mining minigame for you",false,
  function(on) if MG then MG.setEnabled(on) end end,
  function() return MG and MG.enabled end)
+body=pages.Combat
+heading("Defense")
 toggle("Auto Parry","Predicts mob impact from animation poses · equip a melee weapon",false,
  function(on) if AP then AP.setEnabled(on) end end,
  function() return AP and AP.enabled end)
@@ -414,15 +442,30 @@ local _,resetRange=stepper("Parry Range","Only react to attackers inside this di
  math.clamp(tonumber(prefs.parry.range) or 14,6,30),
  function(v) return string.format("%.0f studs",v) end,
  function(v) if AP then AP.range=v end config.set("parry",{range=v}) end)
-heading("Guidance")
+toggle("Boss Attack Alerts","Adaptive cues for profiled boss windups",false,function(on) if BA then BA.setEnabled(on) end end,function() return BA and BA.enabled end)
+body=pages.Gathering
+heading("Resource Navigation")
+toggle("Auto Gather","Navigate to resources · requires Auto Minigames",false,
+ function(on) if GA then GA.setEnabled(on) end end,function() return GA and GA.enabled end)
+toggle("Gather Ores","Include mining nodes",true,
+ function(on) if GA then GA.mining=on end end,function() return GA and GA.mining end)
+toggle("Gather Crops","Include harvesting nodes",true,
+ function(on) if GA then GA.harvesting=on end end,function() return GA and GA.harvesting end)
+toggle("Gather Broom Routes","Experimental · clear flight corridors · controls camera",false,
+ function(on) if GA then GA.broom=on end end,function() return GA and GA.broom end)
+stepper("Gather Radius","Search currently loaded resources nearby",50,1000,50,300,
+ function(v) return string.format("%.0f studs",v) end,function(v) if GA then GA.radius=v end end)
+body=pages.Guidance
+heading("Quest Guidance")
 toggle("Quest Assistance","Draggable tracker · progress · marker controls",false,
  function(on) if QA then QA.setEnabled(on) end end,function() return QA and QA.enabled end)
-toggle("Boss Attack Alerts","Adaptive cues for profiled boss windups",false,function(on) if BA then BA.setEnabled(on) end end,function() return BA and BA.enabled end)
+body=pages.Movement
 heading("Movement")
 local _,resetBroom=stepper("Broom Speed","Flight velocity multiplier · 1 = normal",1,3,0.25,
  math.clamp(tonumber(prefs.broomSpeed) or 1,1,3),
  function(v) return string.format("%.2fx",v) end,
  function(v) H.broomSpeed=v armBroom() config.set("broomSpeed",v) end)
+body=pages.Settings
 heading("Controls")
 for _,entry in ipairs({
  {key="toggle",label="Open / close panel",description="Show or hide the hub"},
@@ -577,7 +620,8 @@ local function refreshStatus()
   label=MG.paused and "Minigames paused" or MG.activity or "Waiting for minigame"
   if MG.lastResult and not MG.paused then label=label.." · "..MG.lastResult end
  end
- -- Combat warning takes priority over other status messages when active.
+ if GA and GA.enabled then label=GA.status end
+  -- Combat warning takes priority over other status messages when active.
  if BA and BA.enabled and BA.status:find("Boss marker",1,true) then label=BA.status end
  if #moduleErrors>0 then label="Module issue · "..moduleErrors[1] end
  if status.Text~=label then status.Text=label end
@@ -646,7 +690,7 @@ end
 -- Panic stop: one key disables every automation, including a parry session
 -- that is mid-swing, without unloading the hub or touching the character.
 local function disableAll(reason)
- for _,module in pairs({MG,QA,BA,AP}) do
+ for _,module in pairs({MG,QA,BA,AP,GA}) do
   if module and module.setEnabled then pcall(module.setEnabled,false) end
  end
  H.broomSpeed=1
@@ -735,6 +779,7 @@ function H.unload()
  if QA and QA.stop then QA.stop() end
  if BA and BA.stop then BA.stop() end
  if AP and AP.stop then AP.stop() end
+ if GA and GA.stop then GA.stop() end
  if config and config.stop then config.stop() end
  for _,c in ipairs(H.connections) do c:Disconnect() end
  table.clear(H.connections)

@@ -24,13 +24,17 @@ class FeatureInteractionTests(unittest.TestCase):
         self.assertNotIn("Build Advisor", runtime)
         self.assertFalse((ROOT / "src/build_advisor.lua").exists())
 
-    def test_only_minigames_send_key_input(self):
+    def test_navigation_and_minigames_have_separate_input_ownership(self):
         owners = {}
         for path in (ROOT / "src").glob("*.lua"):
             text = path.read_text(encoding="utf-8")
             if "SendMouseMoveEvent" in text or "SendKeyEvent" in text:
                 owners[path.name] = True
-        self.assertEqual(sorted(owners), ["minigames.lua"])
+        self.assertEqual(sorted(owners), ["gather.lua", "minigames.lua"])
+        gather = read("src/gather.lua")
+        self.assertNotIn("Enum.KeyCode.Space", gather)
+        self.assertNotIn("mg.setEnabled", gather)
+        self.assertIn("if mg.active or mg.mine or mg.harvest then", gather)
         # Space taps happen only while a round is live and never while typing.
         mg = read("src/minigames.lua")
         self.assertIn("if not state.enabled or state.paused or UIS:GetFocusedTextBox() or not state.active then", mg)

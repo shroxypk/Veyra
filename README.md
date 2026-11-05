@@ -11,12 +11,15 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/shroxypk/Veyra/main/m
 | Feature | Description |
 |---------|-------------|
 | **Auto Minigames** | Solves harvest & mining minigames |
+| **Auto Gather** | Separate crop/ore navigation, obstacle replanning, optional experimental broom routes |
 | **Auto Parry** | Times parries from animation data (180 profiles) |
 | **Quest Assistance** | Tracker + location map with pins |
 | **Boss Attack Alerts** | Windup warnings for profiled bosses |
 | **Broom Speed** | 1×–3× flight multiplier |
 
 ## Controls
+Tabs group features into **Combat**, **Gathering**, **Movement**, **Guidance**, and **Settings**.
+
 | Key | Action |
 |-----|--------|
 | Right Ctrl | Toggle panel |
@@ -29,6 +32,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/shroxypk/Veyra/main/m
 Saved to `Veyra/config.json` (geometry, hotkeys, ranges). Automation toggles always start **off**. `Reset Settings` restores defaults.
 
 ## Links
+- [Gathering setup and limitations](docs/gathering.md)
 - [Parry technical notes](docs/parry.md)
 - [Combat research](docs/combat-research.md)
 - [Diagnostics](docs/diagnostics.md)

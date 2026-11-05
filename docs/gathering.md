@@ -1,0 +1,17 @@
+# Auto Gather
+
+In the **Gathering** tab, enable **Auto Minigames**, choose **Gather Ores** and/or **Gather Crops**, then enable **Auto Gather**. Gathering starts off on every load. The radius defaults to 300 studs from the current position and can be adjusted; this is a moving search radius, not a boundary around your starting position. These gathering options are session-only. Ground travel uses the game's current movement speed; its existing AutoRun setting can enable sprinting during forward movement.
+
+The controller finds loaded `Workspace.Map.Harvestable.Crops` / `Ores` prompts, walks normal Humanoid paths, jumps at jump waypoints, and uses the resource's prompt only within its activation range and with line of sight. It does not change WalkSpeed, teleport, or invoke harvest remotes directly. It does not enable, disable, or replace Auto Minigames. Minigame events suspend navigation until the round closes.
+
+Blocked paths and lack of progress cause replanning using up to four approach points. Failed nodes are skipped for 45 seconds; interactions that do not start a minigame are skipped for 30 seconds. Disabled and depleted nodes are excluded. Newly streamed prompts are registered automatically. Combat, low health, typing, and paused/disabled Auto Minigames pause travel. Character removal disables gathering. Panic and unload release owned movement, keys, prompt holds, camera control, and path listeners.
+
+## Experimental broom routes
+
+**Gather Broom Routes** is optional and off by default. It uses the configured broom key and the game's camera-relative forward control. For longer trips or failed walking routes it checks an ascent, horizontal crossing, and descent corridor at several candidate heights using body-width blockcasts. Flight has progress timeouts, braking, and a ground/water check before dismounting. It restores the camera afterward. Use the normal 1x broom speed while evaluating routes.
+
+If flight is interrupted, the controller releases forward and leaves the broom hovering rather than dismounting at altitude. Land manually to resume. It respects the current no-fly flag, but does not possess a complete map of no-fly volumes or future streamed obstacles. It does not provide arbitrary 3D maze solving, automatic sprint activation, or cross-world travel. No clear route means a skipped node or a pause, not forced movement through a wall.
+
+## Verification boundary
+
+Resource folders, prompt names/ranges, and broom controls were inspected in the connected Clover RPG client. Automated tests cover gating, teardown and release of movement during a minigame; compilation and existing hub tests are also run. This does not establish perfect navigation, XP yield, uninterrupted AFK operation, or freedom from detection. Full gathering and broom loops need gameplay validation.
