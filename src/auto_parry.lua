@@ -519,20 +519,134 @@ local function interrupted(model)
  end
  return false
 end
+-- Mob reach data: animation ID or mob name → reach (studs). Used for attack-range checks.
+-- Values from wiki weapon tables + observed boss ranges. Unknown mobs default to 8.
+local MOB_REACH = {
+	-- Bandit variants (dagger/sword ~7.5-9)
+	["123693468061117"] = 8,   -- Punch1 / BanditSlashA
+	["111510911006717"] = 8,   -- Punch2 / BanditSlashB
+	["85570415456598"] = 8,    -- Punch3 / BanditSlashC
+	["140664544166823"] = 8,   -- Vicious Assault / BanditSlashD
+	["99787918237880"] = 8,    -- Knockback / BanditSlashE
+	["9839879425"] = 8,        -- BanditAnimation
+	["9839904022"] = 8,        -- Bandit/Wounded Alke
+	["9839955546"] = 8,        -- Bandit
+	["9873286798"] = 8,        -- Bandit
+	-- Kamo Guard (spear/polearm ~8.5-9.5)
+	["9839859772"] = 9,        -- KamoGuardAnimation
+	["10028752861"] = 9,       -- KamoGuardAnimation2
+	["18910040255"] = 9,       -- Kamo Guard Respawnable
+	-- Wolf (melee bite ~7.5)
+	["124023674688709"] = 8,   -- WolfAnimation
+	["105273448305185"] = 8,   -- Wolf
+	-- Heavy weapons (greatsword/axe ~9.5-10)
+	["9557400534"] = 10,       -- HeavyDagger
+	["10694823147"] = 10,      -- HeavyRapier
+	["8314692364"] = 10,       -- HammerDown
+	["137057617868950"] = 12,  -- BlightSwipes (boss)
+	["138780595177276"] = 12,  -- BlightClawAnim (boss)
+	-- Alke (boss)
+	["9924282016"] = 10,       -- AlkeCombo
+	["9922542154"] = 12,       -- AlkeRoar/AlkeSkill
+	-- Mushknight (grab+slam ~10)
+	["11469887779"] = 10,      -- GrabLunge
+}
+
+local DEFAULT_REACH = 8
+
+local function getReach(candidate)
+	-- Prefer asset ID, fall back to mob name heuristic
+	if candidate.id and MOB_REACH[candidate.id] then return MOB_REACH[candidate.id] end
+	local name = (candidate.model and candidate.model.Name) or ""
+	if name:find("Guard") or name:find("Sentinel") then return 9 end
+	if name:find("Knight") or name:find("Brute") then return 10 end
+	if name:find("Boss") or name:find("Alke") or name:find("Blight") then return 12 end
+	return DEFAULT_REACH
+end
+
+-- Unparryable moves: animation IDs that should never be parried (grabs, guardbreaks, etc.)
+local UNPARRYABLE = {
+	["14417052527"] = true,  -- Parry reaction
+	["13355016261"] = true,  -- Dodge
+	["13355019718"] = true,  -- Roll
+	["8502285198"] = true,   -- Hit reaction
+	["8495698342"] = true,   -- Hit reaction
+	["8495708006"] = true,   -- Hit reaction
+	["132555387434309"] = true,
+	["93087728991591"] = true,
+	-- Mushknight grab (unparryable per wiki)
+	-- Add more as confirmed
+}
+
+local function isUnparryable(candidate)
+	if candidate.id and UNPARRYABLE[candidate.id] then return true end
+	-- Heuristic: grab/lunge names often unparryable
+	local n = (candidate.name or ""):lower()
+	if n:find("grab") or n:find("lunge") and not n:find("slash") then return true end
+	return false
+end
+
+-- Line-of-sight check: HRP to HRP raycast, ignore attacker and player
+local function hasLOS(root, other)
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = {player.Character, other.Parent}
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local dir = (other.Position - root.Position)
+	local result = workspace:Raycast(root.Position, dir, params)
+	return result == nil or (result.Instance and result.Instance:IsDescendantOf(other.Parent))
+end
+
+-- Priority score: lower = higher priority
+-- Factors: distance, HP%, quest target, is using skill, has unparryable moves
+local function priorityScore(candidate, root, now)
+	local model = candidate.model
+	local h = model:FindFirstChildOfClass("Humanoid")
+	local other = model:FindFirstChild("HumanoidRootPart")
+	if not h or not other then return math.huge end
+
+	local delta = root.Position - other.Position
+	local dist = delta.Magnitude
+	local hpPct = h.MaxHealth > 0 and (h.Health / h.MaxHealth) or 1
+
+	local score = dist * 1.0           -- closer first
+	score += (1 - hpPct) * 30          -- lower HP first
+	score += hpPct * 5                 -- slightly prefer damaged
+
+	-- Quest target bonus
+	if QA and QA.selected and model.Name:find(QA.selected) then score -= 50 end
+
+	-- Skill-user gets priority (anti-gank: only one uses skills)
+	local usingSkill = h:GetAttribute("State_UsingSkill") == true
+		or h:GetAttribute("State_SkillActive") == true
+	if usingSkill then score -= 100 end
+
+	-- Unparryable penalty
+	if isUnparryable(candidate) then score += 200 end
+
+	-- LOS penalty
+	if not hasLOS(root, other) then score += 150 end
+
+	return score
+end
+
 local function incoming(candidate,root,remaining)
  local model=candidate.model
  local h=model:FindFirstChildOfClass("Humanoid")
  local other=model:FindFirstChild("HumanoidRootPart")
  if not h or h.Health<=0 or not other then return false,"attacker unavailable" end
  if interrupted(model) then return false,"attacker interrupted" end
+ if isUnparryable(candidate) then return false,"unparryable move" end
  local delta=root.Position-other.Position
  local distance=delta.Magnitude
+ local reach = getReach(candidate)
  if distance<8 then return true end -- spin/circle attacks: facing is unreliable
  if math.abs(delta.Y)>10 then return false,"height" end
  local direction=delta.Unit
  local closing=(other.AssemblyLinearVelocity-root.AssemblyLinearVelocity):Dot(direction)
- if not timing.inRange(distance,closing,remaining,state.range) then return false,string.format("range %.1f",distance) end
+ -- Use mob's actual reach instead of configured range
+ if not timing.inRange(distance,closing,remaining,reach) then return false,string.format("range %.1f/%.1f",distance,reach) end
  if other.CFrame.LookVector:Dot(direction)<0.25 then return false,"attacker facing away" end
+ if not hasLOS(root, other) then return false,"no LOS" end
  return true
 end
 
