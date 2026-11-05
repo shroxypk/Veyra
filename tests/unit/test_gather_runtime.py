@@ -37,16 +37,19 @@ vm.__sub=function(a,b) return vec(a.X-b.X,a.Y-b.Y,a.Z-b.Z) end
 vm.__add=function(a,b) return vec(a.X+b.X,a.Y+b.Y,a.Z+b.Z) end
 vm.__index=function(v,k) if k=="Magnitude" then return math.sqrt(v.X*v.X+v.Y*v.Y+v.Z*v.Z) end end
 local Vector3={new=vec,zero=vec(0,0,0)}
-local Enum={RaycastFilterType={Exclude=1},Material={Water=1},PathStatus={Success=1},PathWaypointAction={Jump=1}}
+local Enum={HumanoidRigType={R6=1,R15=2},RaycastFilterType={Exclude=1},Material={Water=1},PathStatus={Success=1},PathWaypointAction={Jump=1}}
 local RaycastParams={new=function() return {} end}
-local root={Position=vec(0,3,0)}
+local OverlapParams={new=function() return {} end}
+local CFrame={new=function(v) return v end}
+local root={Position=vec(0,3,0),Size=vec(2,2,1)}
 local moves,holds,ends,computes=0,0,0,0
-local h={Health=100,MaxHealth=100,RootPart=root}
+local h={Health=100,MaxHealth=100,RootPart=root,HipHeight=2}
 function h:MoveTo(v) moves+=1 self.goal=v end
 function h:Move() end
 local char={}
+local leg={Size=vec(1,4,1)}
 function char:FindFirstChildOfClass() return h end
-function char:FindFirstChild() return root end
+function char:FindFirstChild(name) if name=="Left Leg" then return leg end return root end
 function char:GetAttribute() return false end
 local player={Character=char,CharacterRemoving=signal()}
 function player:GetAttribute() return false end
@@ -63,8 +66,12 @@ local map={FindFirstChild=function() return harvest end}
 local workspace={DescendantAdded=signal(),DescendantRemoving=signal()}
 function workspace:FindFirstChild() return map end
 function workspace:GetDescendants() return {prompt} end
-function workspace:Raycast(_,direction)
- if direction.Y==-30 then return {Position=vec(15,0,0),Material=0} end
+local obstructedApproaches=false
+function workspace:GetPartBoundsInBox() return obstructedApproaches and {part} or {} end
+function workspace:Blockcast() return nil end
+function workspace:Raycast(origin,direction)
+ if direction.Y>0 and obstructedApproaches then return {Position=origin,Material=0,Normal=vec(0,1,0)} end
+ if direction.Y==-20 then return {Position=vec(origin.X,0,origin.Z),Material=0,Normal=vec(0,1,0)} end
  return nil
 end
 local task={}
@@ -96,7 +103,7 @@ assert(holds==0 and state.status=="Paused for typing")
 state.setEnabled(false) focused=false
 G.VeyraMinigames.active=true
 state.setEnabled(true)
-assert(holds==0 and moves==0 and state.status=="Waiting for minigame")
+assert(holds==0 and moves==0 and state.phase=="session")
 state.setEnabled(false) G.VeyraMinigames.active=false
 state.setEnabled(true)
 assert(holds==1 and ends==1 and moves==0, "prompt must release on session handoff")
@@ -106,21 +113,42 @@ assert(G.VeyraMinigames.active, "gather stop must not stop minigames")
 G.VeyraMinigames.active=false
 part.Position=vec(20,3,0)
 state.setEnabled(true)
-assert(computes==1 and moves==1, "ground path should begin")
+assert(computes==4 and moves==1, "ground path should begin after comparing approaches")
 G.VeyraMinigames.active=true
 assert(coroutine.resume(latest))
 assert(h.goal==root.Position, "a minigame opening during travel must stop movement")
 state.setEnabled(false) G.VeyraMinigames.active=false
 state.setEnabled(true)
-for i=1,100 do assert(coroutine.resume(latest)) end
-assert(computes==5 and holds==1, "stuck paths must have bounded retries and no remote interaction")
-assert(state.status=="Waiting for nearby resources", "failed node must enter cooldown")
+for i=1,100 do
+ assert(coroutine.resume(latest))
+ if state.stats.skipped==1 then break end
+end
+assert(computes<=16 and holds==1 and state.stats.stalls==1, "do not repeatedly walk into the same blocked segment")
+assert(state.phase=="skipped" and state.stats.skipped==1, "failed node must enter cooldown")
 state.setEnabled(false)
 clock+=46
 state.setEnabled(true)
 local before=moves
 player.CharacterRemoving:Fire()
 assert(not state.enabled and moves==before+1 and h.goal==root.Position, "respawn must cancel movement")
+obstructedApproaches=true
+local plansBefore=computes
+state.setEnabled(true)
+assert(computes==plansBefore and not state.status:find("error"), "reject occupied approaches before pathfinding")
+state.setEnabled(false)
+-- Stale sessions stop gathering without changing the independent minigame module.
+obstructedApproaches=false clock+=200
+h.RigType=Enum.HumanoidRigType.R6 h.HipHeight=0
+root.Position=vec(0,5,0) part.Position=vec(20,8,0)
+local r6Moves=moves
+state.setEnabled(true)
+assert(moves>r6Moves, "R6 standing clearance must include leg height, not just HipHeight")
+state.setEnabled(false)
+G.VeyraMinigames.active=true
+state.setEnabled(true)
+clock+=31
+assert(coroutine.resume(latest))
+assert(not state.enabled and state.phase=="session-timeout" and G.VeyraMinigames.active)
 state.stop()
 assert(G.VeyraGather==nil and not state.alive)
 for _,s in ipairs(signals) do

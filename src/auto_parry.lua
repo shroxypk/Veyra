@@ -519,8 +519,9 @@ local function interrupted(model)
  end
  return false
 end
--- Mob reach data: animation ID or mob name → reach (studs). Used for attack-range checks.
+-- Mob reach data: animation ID or mob name → reach (studs). Used as fallback when state.range is not set.
 -- Values from wiki weapon tables + observed boss ranges. Unknown mobs default to 8.
+-- UNPARRYABLE moves are excluded; they are blocked by isUnparryable() before range checks.
 local MOB_REACH = {
 	-- Bandit variants (dagger/sword ~7.5-9)
 	["123693468061117"] = 8,   -- Punch1 / BanditSlashA
@@ -543,13 +544,8 @@ local MOB_REACH = {
 	["9557400534"] = 10,       -- HeavyDagger
 	["10694823147"] = 10,      -- HeavyRapier
 	["8314692364"] = 10,       -- HammerDown
-	["137057617868950"] = 12,  -- BlightSwipes (boss)
-	["138780595177276"] = 12,  -- BlightClawAnim (boss)
 	-- Alke (boss)
 	["9924282016"] = 10,       -- AlkeCombo
-	["9922542154"] = 12,       -- AlkeRoar/AlkeSkill
-	-- Mushknight (grab+slam ~10)
-	["11469887779"] = 10,      -- GrabLunge
 }
 
 local DEFAULT_REACH = 8
@@ -565,6 +561,7 @@ local function getReach(candidate)
 end
 
 -- Unparryable moves: animation IDs that should never be parried (grabs, guardbreaks, etc.)
+-- Verified from client animation folders and wiki. Do not guess.
 local UNPARRYABLE = {
 	["14417052527"] = true,  -- Parry reaction
 	["13355016261"] = true,  -- Dodge
@@ -574,15 +571,20 @@ local UNPARRYABLE = {
 	["8495708006"] = true,   -- Hit reaction
 	["132555387434309"] = true,
 	["93087728991591"] = true,
-	-- Mushknight grab (unparryable per wiki)
-	-- Add more as confirmed
+	-- Mushknight grab (unparryable per wiki - guardbreak)
+	["11469887779"] = true,  -- GrabLunge
+	-- Lizard Boss (guardbreak moves)
+	["137057617868950"] = true,  -- BlightSwipes
+	["138780595177276"] = true,  -- BlightClawAnim
+	-- Alke boss (unparryable skills)
+	["9922542154"] = true,       -- AlkeRoar/AlkeSkill
 }
 
 local function isUnparryable(candidate)
 	if candidate.id and UNPARRYABLE[candidate.id] then return true end
 	-- Heuristic: grab/lunge names often unparryable
 	local n = (candidate.name or ""):lower()
-	if n:find("grab") or n:find("lunge") and not n:find("slash") then return true end
+	if n:find("grab") or (n:find("lunge") and not n:find("slash")) then return true end
 	return false
 end
 
@@ -639,13 +641,15 @@ local function incoming(candidate,root,remaining)
  local delta=root.Position-other.Position
  local distance=delta.Magnitude
  local reach = getReach(candidate)
- if distance<8 then return true end -- spin/circle attacks: facing is unreliable
+ -- Spin/circle attacks at very close range: skip facing check but still require LOS/height
+ local isCloseSpin = distance < 8
  if math.abs(delta.Y)>10 then return false,"height" end
  local direction=delta.Unit
  local closing=(other.AssemblyLinearVelocity-root.AssemblyLinearVelocity):Dot(direction)
- -- Use mob's actual reach instead of configured range
- if not timing.inRange(distance,closing,remaining,reach) then return false,string.format("range %.1f/%.1f",distance,reach) end
- if other.CFrame.LookVector:Dot(direction)<0.25 then return false,"attacker facing away" end
+ -- Use configured parry range (state.range) for the UI slider; fall back to mob reach if not set
+ local effectiveRange = state.range or reach
+ if not timing.inRange(distance,closing,remaining,effectiveRange) then return false,string.format("range %.1f/%.1f",distance,effectiveRange) end
+ if not isCloseSpin and other.CFrame.LookVector:Dot(direction)<0.25 then return false,"attacker facing away" end
  if not hasLOS(root, other) then return false,"no LOS" end
  return true
 end

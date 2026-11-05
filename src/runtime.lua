@@ -6,6 +6,8 @@ if G.VeyraQuestAssist then G.VeyraQuestAssist.stop() end
 if G.VeyraParry then G.VeyraParry.stop() end
 if G.VeyraBossAlerts then G.VeyraBossAlerts.stop() end
 if G.VeyraGather then G.VeyraGather.stop() end
+if G.VeyraSkillRotation then G.VeyraSkillRotation.stop() end
+if G.VeyraDodge then G.VeyraDodge.stop() end
   -- Legacy guard: builds before v2 kept a Kill Aura module here. Reloading the
   -- hub must release its held mouse button, or it keeps swinging on its own.
   if G.VeyraKillAura and G.VeyraKillAura.stop then G.VeyraKillAura.stop() end
@@ -87,6 +89,12 @@ startModule("quest assist",function() loadstring(readfile("Veyra/src/quest_assis
 startModule("boss alerts",function() loadstring(readfile("Veyra/src/boss_alerts.lua"),"boss_alerts.lua")() end)
 startModule("auto parry",function() loadstring(readfile("Veyra/src/auto_parry.lua"),"auto_parry.lua")() end)
 startModule("gathering",function() loadstring(readfile("Veyra/src/gather.lua"),"gather.lua")() end)
+startModule("auto skill rotation",function() loadstring(readfile("Veyra/src/auto_skill_rotation.lua"),"auto_skill_rotation.lua")() end)
+startModule("auto dodge",function() loadstring(readfile("Veyra/src/auto_dodge.lua"),"auto_dodge.lua")() end)
+local SR = G.VeyraSkillRotation
+H.skillRotation=SR
+local AD = G.VeyraDodge
+H.autoDodge=AD
 local GA=G.VeyraGather
 H.gather=GA
 local AP = G.VeyraParry
@@ -438,6 +446,12 @@ heading("Defense")
 toggle("Auto Parry","Predicts mob impact from animation poses · equip a melee weapon",false,
  function(on) if AP then AP.setEnabled(on) end end,
  function() return AP and AP.enabled end)
+toggle("Auto Skill Rotation","Cycles Magic.Cast / Tools.BasicTechnique on cooldown",false,
+ function(on) if SR then SR.setEnabled(on) end end,
+ function() return SR and SR.enabled end)
+toggle("Auto Dodge","Rolls for unparryables · fills parry cooldown gaps",false,
+ function(on) if AD then AD.setEnabled(on) end end,
+ function() return AD and AD.enabled end)
 local _,resetRange=stepper("Parry Range","Only react to attackers inside this distance",6,30,1,
  math.clamp(tonumber(prefs.parry.range) or 14,6,30),
  function(v) return string.format("%.0f studs",v) end,
@@ -690,7 +704,7 @@ end
 -- Panic stop: one key disables every automation, including a parry session
 -- that is mid-swing, without unloading the hub or touching the character.
 local function disableAll(reason)
- for _,module in pairs({MG,QA,BA,AP,GA}) do
+ for _,module in pairs({MG,QA,BA,AP,GA,SR,AD}) do
   if module and module.setEnabled then pcall(module.setEnabled,false) end
  end
  H.broomSpeed=1
@@ -780,6 +794,8 @@ function H.unload()
  if BA and BA.stop then BA.stop() end
  if AP and AP.stop then AP.stop() end
  if GA and GA.stop then GA.stop() end
+ if SR and SR.stop then SR.stop() end
+ if AD and AD.stop then AD.stop() end
  if config and config.stop then config.stop() end
  for _,c in ipairs(H.connections) do c:Disconnect() end
  table.clear(H.connections)
