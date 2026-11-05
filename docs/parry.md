@@ -126,12 +126,12 @@ does not extend the parry window or guarantee mitigation of unblockable moves.
 `tools/import_parry_assets.py` merges the resulting derived JSON into a marker
 dump while preserving authored profiles. Probe data is local research input.
 
-A parry cannot be held, and a whiff costs about four times the window, so
-continuous protection is impossible by design; the ceiling is roughly 26%
-uptime. What is achievable, and is what this build does, is putting the 0.25 s
-you do get exactly on the impact, and not spending it on attacks that cannot be
-parried. There is no client-side path to forging the server's parry resolution,
-and this project does not attempt one.
+A parry cannot be extended indefinitely by holding block. The measured whiff
+lockout limits repeated failed attempts; it is not a universal uptime ceiling,
+because successful parries have different recovery behavior. This build aims
+to align inputs with impacts, but does not establish that every profiled attack
+is parryable. See [combat research](combat-research.md) for public-source rules,
+guardbreak and failed-parry recovery concerns, and remaining implementation gaps.
 
 ## Live diagnostics
 

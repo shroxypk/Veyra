@@ -11,7 +11,7 @@ from build import build
 ROOT = Path(__file__).resolve().parents[1]
 FILES = (
     ".gitignore", "README.md", "main.lua", ".github/workflows/verify.yml",
-    "docs/parry.md", "docs/diagnostics.md",
+    "docs/parry.md", "docs/diagnostics.md", "docs/combat-research.md",
     "src/runtime.lua", "src/minigames.lua", "src/quest_assist.lua",
     "src/auto_parry.lua", "src/parry_math.lua", "src/parry_profiles.lua",
     "src/boss_alerts.lua",
