@@ -48,13 +48,13 @@ for _ in pairs(profiles_) do profileCount+=1 end
 
 local state={enabled=false,alive=true,status="Parry off",profiles=profileCount,
  range=14,leadOffset=0,lead=0.1,grantLag=0.15,attempts=0,grants=0,confirmed=0,damageEvents=0,
- unknown=0,missed=0,covered=0,gated=0,learned=0,calibrated=false,bias={},hitResiduals={},
+ unknown=0,missed=0,covered=0,gated=0,learned=0,calibrated=true,bias={},hitResiduals={},
  unparryable={},unparryableSkips=0,cooldownWait=0,
  unobservedGrants=0,successByAsset={},
  unknownAssets={},derived=0,log={}}
 G.VeyraParry=state
 
-local animators,watches,pending,defensive={},{},{},{}
+local animators,watches,pending={},{},{}
 local discoveryAdded,discoveryRemoved
 local seen=setmetatable({},{__mode="k"})
 local worker,packet,manager,character,healthConnection,attributeConnection
@@ -64,7 +64,7 @@ local nextScan=0
 -- outbound send->grant (scheduling lead); observed grant lag (session length)
 local lead=0.1
 local grantLag=0.15
-local calibrateAt,pendingGate
+local pendingGate
 local activeAttempt
 local serverAnimations={}
 local suitOnly={} -- Hit/Blocks/Parrys reaction animations are not attacks
@@ -302,7 +302,6 @@ end
 local function clearCharacter()
  endSession("reset")
  table.clear(pending)
- table.clear(defensive)
  table.clear(seen)
  activeAttempt=nil
  if healthConnection then healthConnection:Disconnect() healthConnection=nil end
@@ -382,12 +381,7 @@ local function bindCharacter(c)
      end
     end
     log(string.format("grant in %.3fs (lead %.3f)",observed,lead))
-    if session.holdUntil and os.clock()<session.holdUntil then
-     -- Defensive hold: keep blocking until the unprofiled swing finishes.
-     log("holding block for unprofiled swing")
-    else
-     endSession("grant")
-    end
+    endSession("grant")
    else
     log("grant without an active session")
    end
@@ -465,20 +459,15 @@ local function observe(model,track)
  local id=track.Animation and track.Animation.AnimationId:match("%d+")
  if id and suitOnly[id] then return end
  local profile=id and (profiles_[id] or derived[id])
- if not profile then
-   local attack,animId=attackLike(track)
-  if attack and animId then
-   derive(animId,track.Animation.Name)
-   -- First encounter: block through the swing instead of guessing an impact.
-   -- The next play of the same asset is scheduled from the derived profile.
-   table.insert(defensive,{model=model,track=track,
-    name=track.Animation.Name or ("asset "..animId),expires=os.clock()+12})
-  end
-  if id and serverAnimations[id] and not state.unknownAssets[id] then
+ -- No profile = no press. Derive in background for future plays; do not guess.
+ if not profile and id then
+  local attack,animId=attackLike(track)
+  if attack and animId then derive(animId,track.Animation.Name) end
+  if serverAnimations[id] and not state.unknownAssets[id] then
    state.unknownAssets[id]=true state.unknown+=1 log("unsupported melee asset "..id)
   end
-  return
  end
+ if not profile then return end
  if track.Looped then return end
  for _,hit in ipairs(profile.hits) do
   table.insert(pending,{model=model,track=track,hit=hit,name=profile.name,id=id,
@@ -510,7 +499,6 @@ local function scan()
        -- A reused track is a new attack even if no scan saw it stop.
        seen[track]=nil
         for i=#pending,1,-1 do if pending[i].track==track then table.remove(pending,i) end end
-        for i=#defensive,1,-1 do if defensive[i].track==track then table.remove(defensive,i) end end
        observe(model,track)
       end)}
      end
@@ -548,17 +536,15 @@ local function incoming(candidate,root,remaining)
  return true
 end
 
-local function startSession(now,name,calibration,holdUntil)
+local function startSession(now,name,calibration)
  local okServer,sendServer=pcall(function() return workspace:GetServerTimeNow() end)
  if not send("Block Input") then return false end
  lastSent=now
  -- Keep the session open long enough to observe the grant, then release.
- -- A defensive session instead stays held until its swing ends.
  session={sentAt=now,sendServer=okServer and sendServer or nil,
-  deadline=holdUntil or (now+math.min(PULSE_DEADLINE,math.max(SESSION_MIN,grantLag+0.06))),
-  holdUntil=holdUntil,calibration=calibration or nil}
+  deadline=now+math.min(PULSE_DEADLINE,math.max(SESSION_MIN,grantLag+0.06)),
+  calibration=calibration or nil}
  if not calibration then
-  calibrateAt=nil
   state.attempts+=1
   activeAttempt={name=name,time=now}
   log(string.format("input %s lead=%.3f gate=%s",name,lead,
@@ -573,12 +559,6 @@ local function step()
  local now=os.clock()
  if player.Character~=character then bindCharacter(player.Character) end
  if session and now>=session.deadline then endSession("timeout") end
- if session and session.defensive then
-  local candidate=session.defensive
-  local root=character and character:FindFirstChild("HumanoidRootPart")
-  if not root or not candidate.track.IsPlaying or not candidate.model:IsDescendantOf(workspace)
-   or not incoming(candidate,root,0) then endSession("swing ended") end
- end
  if deriveDirty and now>=deriveSaveAt then deriveSaveAt=now+2 saveDerived() end
  if now>=nextScan then nextScan=now+0.4 scan() end
  local root,reason=ready()
@@ -612,37 +592,8 @@ local function step()
   state.blockedReason=reason
  end
  if session then return end
- -- Unprofiled swings: block through the animation on the first encounter so it
- -- is mitigated, then the derived profile times every later play. The hold is
- -- bounded and only starts when the attacker is actually in range.
- for index=#defensive,1,-1 do
-  local candidate=defensive[index]
-  local track=candidate.track
-  if not candidate.model:IsDescendantOf(workspace) or not track.IsPlaying
-   or now>candidate.expires then
-   table.remove(defensive,index)
-   elseif root and now>=notBefore and now-lastSent>=PRESS_RATE and #pending==0 and track.Speed>0.01 then
-    local remaining=math.max(0,((track.Length or 0)-track.TimePosition)/track.Speed)
-   local okIn,inRange=pcall(incoming,candidate,root,remaining)
-   if okIn and inRange and remaining>0.05 then
-     if startSession(now,candidate.name,false,now+math.min(remaining+0.05,1.5)) then
-      session.defensive=candidate
-      table.remove(defensive,index)
-      break
-    end
-   end
-  end
- end
- if session then return end
- -- Measure this machine's real grant latency once, in place and with no
- -- attack pending, instead of trusting GetNetworkPing.
-  if calibrateAt and now>=calibrateAt then
-   calibrateAt=nil
-   if #pending==0 and available and now-lastSent>=PRESS_RATE then
-   startSession(now,nil,true)
-   return
-  end
- end
+ -- No idle calibration: a whiff can impose recovery lag. Only press on profiles.
+ -- No defensive hold: unknown attacks may be unparryable or guardbreaking.
   -- Calibration is optional: a pending attack must never be blocked by it.
  local best,bestLatest
  for i=#pending,1,-1 do
@@ -756,7 +707,6 @@ function state.setEnabled(on)
   state.status="Parry: input unavailable" log(tostring(result)) return false
  end
  packet=result state.enabled=true nextScan=0
- calibrateAt=(not state.calibrated) and (os.clock()+0.8) or nil
  discoveryAdded=workspace.DescendantAdded:Connect(function(item)
   if item:IsA("Animator") then animators[item]=true end
  end)
