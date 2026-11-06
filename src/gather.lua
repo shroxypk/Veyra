@@ -5,12 +5,13 @@ local player=game:GetService("Players").LocalPlayer
 local paths=game:GetService("PathfindingService")
 local UIS=game:GetService("UserInputService")
 local VIM=game:GetService("VirtualInputManager")
-local state={alive=true,enabled=false,mining=true,harvesting=true,broom=false,radius=300,status="Gathering off",phase="off",log={},stats={plans=0,stalls=0,skipped=0,sessions=0}}
+local state={alive=true,enabled=false,mining=true,harvesting=true,broom=false,radius=300,status="Gathering off",phase="off",opportunistic=nil,log={},stats={plans=0,stalls=0,skipped=0,sessions=0}}
 G.VeyraGather=state
 local generation=0
 local nodes={}
 local skipped=setmetatable({},{__mode="k"})
 local failures=setmetatable({},{__mode="k"})
+local approach=setmetatable({},{__mode="k"})
 local connections={}
 local held={}
 local promptHeld,walking,blockedConnection,cameraSnapshot,worker
@@ -23,6 +24,7 @@ local function report(phase,message)
  end
 end
 local function cooldown(p,reason)
+ approach[p]=nil
  failures[p]=math.min((failures[p] or 0)+1,4)
  local seconds=30*failures[p]
  skipped[p]=os.clock()+seconds
@@ -122,12 +124,39 @@ local function available(p)
  return type(health)~="number" or health>0
 end
 local function inRange(p,r)
- return p.Parent and (r.Position-p.Parent.Position).Magnitude<=math.max(1,p.MaxActivationDistance-1)
+ return p.Parent and (r.Position-p.Parent.Position).Magnitude<=math.max(1,p.MaxActivationDistance-0.75)
 end
 local function sight(p,r,c)
  local hit=workspace:Raycast(r.Position,p.Parent.Position-r.Position,params(c))
  return not hit or hit.Instance:IsDescendantOf(p.Parent.Parent)
 end
+-- Anything already within prompt reach is harvested before a trip is planned.
+-- Without this the walker commits to a distant node and strolls past crops that
+-- were one step away.
+local function reachableNode(r,c,limit)
+ local best,bestDistance
+ for other in pairs(nodes) do
+  if available(other) and other.Parent then
+   local reach=math.min(limit,other.MaxActivationDistance-1.5)
+   local distance=(other.Parent.Position-r.Position).Magnitude
+   if distance<=reach and (not best or distance<bestDistance) and sight(other,r,c) then
+    best,bestDistance=other,distance
+   end
+  end
+ end
+ return best
+end
+-- Torso-height sweep between two points. Used to cut corners across open ground
+-- without clipping through walls; the floor sits below the box, so it is ignored.
+local function walkClear(from,to,c)
+ -- Sweep horizontally at torso height. The target waypoint sits on the floor, so
+ -- using its real Y would drive the box into the ground and fail every time.
+ local flat=Vector3.new(to.X,from.Y,to.Z)
+ local delta=flat-from
+ if delta.Magnitude<0.1 then return true end
+ return workspace:Blockcast(CFrame.new(from+Vector3.new(0,1.2,0)),Vector3.new(1.6,3,1.6),delta,params(c))==nil
+end
+local LOOKAHEAD=12
 local function standingPoint(p,offset,c,h,r)
  local target=p.Parent.Position
  -- Exclude the node: ore tops and decoration are not useful standing floors.
@@ -151,7 +180,7 @@ end
 local function retreat(point,c,h,r,id)
  if not point or not ready(id) or player.Character~=c then return end
  local delta=point-r.Position
- if delta.Magnitude<1 or delta.Magnitude>9 or math.abs(delta.Y)>3 then return end
+ if delta.Magnitude<1 or delta.Magnitude>9 or math.abs(delta.Y)>6 then return end
  if workspace:Blockcast(CFrame.new(r.Position+Vector3.new(0,0.5,0)),Vector3.new(2,3,2),delta,params(c)) then return end
  local floor=workspace:Raycast(point,Vector3.new(0,-7,0),params(c))
  if not floor or floor.Material==Enum.Material.Water then return end
@@ -166,14 +195,21 @@ local function tryStepJump(goal,c,h,r)
  local delta=goal-r.Position
  local flat=Vector3.new(delta.X,0,delta.Z)
  if flat.Magnitude<0.5 then return false end
- local direction=flat.Unit*3
+ local direction=flat.Unit
  local query=params(c)
- -- One ordinary jump for a low obstruction, never repeated jumps into a wall.
- if not workspace:Raycast(r.Position,direction,query) then return false end
- if workspace:Raycast(r.Position+Vector3.new(0,3,0),direction,query) then return false end
- if workspace:Raycast(r.Position,Vector3.new(0,6,0),query) then return false end
- local floor=workspace:Raycast(r.Position+direction+Vector3.new(0,3,0),Vector3.new(0,-10,0),query)
+ -- Never jump under an overhang.
+ if workspace:Raycast(r.Position+Vector3.new(0,1,0),Vector3.new(0,7,0),query) then return false end
+ -- Probe at ankle, knee and waist height. A one-stud step is invisible from the
+ -- root, which sits three studs above the floor.
+ local hit=workspace:Raycast(r.Position+Vector3.new(0,-2.2,0),direction*3,query)
+  or workspace:Raycast(r.Position+Vector3.new(0,-1.2,0),direction*3,query)
+  or workspace:Raycast(r.Position,direction*3,query)
+ if not hit then return false end
+ -- There has to be standable floor beyond the obstruction, at a climbable height.
+ local ahead=r.Position+direction*3
+ local floor=workspace:Raycast(ahead+Vector3.new(0,7,0),Vector3.new(0,-14,0),query)
  if not floor or floor.Material==Enum.Material.Water or floor.Normal.Y<0.7 then return false end
+ if floor.Position.Y-r.Position.Y>7 then return false end
  h.Jump=true
  state.stats.jumps=(state.stats.jumps or 0)+1
  return true
@@ -211,13 +247,17 @@ local function trySidestep(goal,c,h,r,id)
  walking=h h:MoveTo(point)
  local untilTime=os.clock()+0.7
  while ready(id) and player.Character==c and os.clock()<untilTime do task.wait(0.1) end
+ -- Resume the original goal; leaving MoveTo on the sidestep point is what made
+ -- the capsule wander away from the route.
+ h:MoveTo(goal)
  return true
 end
 local function groundRoute(p,id)
  local c,h,r=character()
  if not c or not h or not r then return false end
+ state.opportunistic=nil
  local margin=math.clamp(p.MaxActivationDistance-2,2,5)
- local totalDeadline=os.clock()+45
+ local totalDeadline=os.clock()+30
  local rejected,blockedGoals={},{}
  for attempt=1,3 do
   if not ready(id) or not available(p) then return false end
@@ -241,7 +281,7 @@ local function groundRoute(p,id)
   for optionIndex=1,math.min(4,#options) do
    if not ready(id) or not available(p) or os.clock()>totalDeadline then return false end
    local option=options[optionIndex]
-   local path=paths:CreatePath({AgentRadius=2.25,AgentHeight=math.max(5,rootOffset(c,h,r)+2),AgentCanJump=true,WaypointSpacing=3,Costs={Water=math.huge}})
+   local path=paths:CreatePath({AgentRadius=2.25,AgentHeight=math.max(5,rootOffset(c,h,r)+2),AgentCanJump=true,WaypointSpacing=6,Costs={Water=math.huge}})
    state.stats.plans+=1
    local ok=pcall(function() path:ComputeAsync(r.Position,option.point) end)
    if not ready(id) or not available(p) or player.Character~=c then return false end
@@ -267,82 +307,110 @@ local function groundRoute(p,id)
   if not chosen then state.lastFailure="no clear walking route" return false end
   rejected[chosen.index]=true
   do
-    local path=chosen.path
-     local current=1
-    local obstructed=false
-    blockedConnection=path.Blocked:Connect(function(index) if index>=current then obstructed=true end end)
-    walking=h
-    local failed=false
-    local lastSafe=r.Position
-    for i,waypoint in ipairs(chosen.waypoints) do
-     current=i
-     if not ready(id) or not available(p) or player.Character~=c then failed=true break end
-     if inRange(p,r) and sight(p,r,c) then break end
-     state.phase="walking"
-     state.status=string.format("Walking to %s · %d/%d",state.target,i,#chosen.waypoints)
-     h:MoveTo(waypoint.Position)
-     local began,lastProgress,best=os.clock(),os.clock(),math.huge
-     local retriedJump,stepped=false,false
-     local lastMoved,lastPosition=os.clock(),r.Position
-     local nextWaypoint=chosen.waypoints[i+1]
-     local function reached()
-      local delta=r.Position-waypoint.Position
-       -- Humanoid MoveTo itself completes within roughly one stud.
-       local rootHeight=rootOffset(c,h,r)
-       if Vector3.new(delta.X,0,delta.Z).Magnitude<=1.25 and math.abs(delta.Y-rootHeight)<=2.5 then return true end
-       -- MoveTo cannot always land on the exact stud. Once the following
-       -- waypoint is clearly closer than this one, we have passed it.
-       if nextWaypoint then
-        local here=Vector3.new(delta.X,0,delta.Z).Magnitude
-        local ahead=r.Position-nextWaypoint.Position
-        if Vector3.new(ahead.X,0,ahead.Z).Magnitude<here-0.75 then return true end
-       end
-       return false
-     end
-     while not reached() do
-      if not ready(id) or not available(p) or player.Character~=c then failed=true break end
-      if inRange(p,r) and sight(p,r,c) then break end
-      local distance=(r.Position-waypoint.Position).Magnitude
-      if distance<best-0.35 then best=distance lastProgress=os.clock() end
-      -- Displacement, not just clock time: a capsule pinned on a doorframe
-      -- stops moving long before the 1.25s timeout would fire.
-      if (r.Position-lastPosition).Magnitude>0.35 then
-       lastPosition=r.Position lastMoved=os.clock()
-      end
-      local stuck=os.clock()-lastMoved>0.6
-      if waypoint.Action==Enum.PathWaypointAction.Jump and not retriedJump and distance<=4 then
-       retriedJump=true
-       if h.FloorMaterial~=Enum.Material.Air
-        and not workspace:Raycast(r.Position,Vector3.new(0,6,0),params(c)) then
-        h.Jump=true
-        state.stats.jumps=(state.stats.jumps or 0)+1
-        lastProgress=os.clock() lastMoved=os.clock()
-       end
-      end
-      if stuck and not retriedJump then
-       retriedJump=true
-       if tryStepJump(waypoint.Position,c,h,r) then
-        lastProgress=os.clock() lastMoved=os.clock()
-       end
-      end
-      if stuck and not stepped and os.clock()-lastProgress>0.9 then
-       stepped=true
-       if trySidestep(waypoint.Position,c,h,r,id) then
-        lastProgress=os.clock() lastMoved=os.clock()
-       end
-      end
-      if obstructed or os.clock()-lastProgress>1.6 or os.clock()-began>6 or os.clock()>totalDeadline then
-       failed=true state.stats.stalls+=1 state.lastFailure="blocked or stalled route"
-       table.insert(blockedGoals,waypoint.Position)
-       break
-      end
-      task.wait(0.1)
-     end
-     if failed then release() retreat(lastSafe,c,h,r,id) break end
-     lastSafe=r.Position
+   local waypoints=chosen.waypoints
+   local goalIndex=#waypoints>1 and 2 or 1
+   local obstructed=false
+   blockedConnection=chosen.path.Blocked:Connect(function(index) if index>=goalIndex-1 then obstructed=true end end)
+   walking=h
+   local failed=false
+   local lastSafe=r.Position
+   local began=os.clock()
+   local lastMoved,lastPosition=os.clock(),r.Position
+   local retriedJump,stepped,jumped=false,false,false
+   local lastGoal
+   local nextOpportunity=os.clock()+0.4
+   local function arrived()
+    local waypoint=waypoints[goalIndex]
+    if not waypoint then return true end
+    local delta=r.Position-waypoint.Position
+    -- Waypoints sit on the walkable surface, so the root is roughly a body
+    -- height above them. Comparing Y was what stalled every route before.
+    return Vector3.new(delta.X,0,delta.Z).Magnitude<=1.8 and math.abs(delta.Y)<=8
+   end
+   while true do
+    if not ready(id) or not available(p) or player.Character~=c then failed=true break end
+    if inRange(p,r) and sight(p,r,c) then break end
+    state.phase="walking"
+    state.status=string.format("Walking to %s · %d/%d",state.target,goalIndex,#waypoints)
+    -- Do not stroll past a crop that is already within reach.
+    if os.clock()>=nextOpportunity then
+     nextOpportunity=os.clock()+0.45
+     local other=reachableNode(r,c,8)
+     if other and other~=p then state.opportunistic=other break end
     end
+    -- Honour the pathfinder's jump markers first. The marker sits at the foot
+    -- of the ledge, so retarget to the landing waypoint and jump; targeting the
+    -- marker itself makes the humanoid hop in place against the step.
+    local waypoint=waypoints[goalIndex]
+    local distance=waypoint and (r.Position-waypoint.Position).Magnitude or 0
+    if waypoint and waypoint.Action==Enum.PathWaypointAction.Jump and distance<=4 and not jumped then
+     jumped=true
+     local landing=waypoints[goalIndex+1] or waypoint
+     h:MoveTo(landing.Position)
+     lastGoal=landing.Position
+     if h.FloorMaterial~=Enum.Material.Air
+      and not workspace:Raycast(r.Position+Vector3.new(0,1,0),Vector3.new(0,7,0),params(c)) then
+      h.Jump=true
+      state.stats.jumps=(state.stats.jumps or 0)+1
+     end
+     goalIndex=math.min(goalIndex+1,#waypoints)
+     lastMoved=os.clock()
+    end
+    -- Rolling look-ahead: target the furthest clear waypoint instead of
+    -- re-issuing MoveTo every few studs, which is what made the walk stutter.
+    local advanced=goalIndex
+    for j=goalIndex+1,math.min(#waypoints,goalIndex+8) do
+     local ahead=waypoints[j]
+     local flat=Vector3.new(ahead.Position.X-r.Position.X,0,ahead.Position.Z-r.Position.Z).Magnitude
+     if flat>LOOKAHEAD then break end
+     if math.abs(ahead.Position.Y-r.Position.Y)>6 then break end
+     if ahead.Action==Enum.PathWaypointAction.Jump then break end
+     if not walkClear(r.Position,ahead.Position,c) then break end
+     advanced=j
+    end
+    if advanced~=goalIndex then goalIndex=advanced lastGoal=nil end
+    local goal=waypoints[goalIndex].Position
+    local goalDistance=(r.Position-goal).Magnitude
+    -- MoveTo halts the humanoid when it reaches its goal, so only re-issue when
+    -- the goal changes or the capsule is about to arrive.
+    if not lastGoal or (lastGoal-goal).Magnitude>0.5 or goalDistance<1.5 then
+     h:MoveTo(goal) lastGoal=goal
+    end
+    if arrived() then
+     if goalIndex>=#waypoints then break end
+     goalIndex+=1 lastGoal=nil jumped=false
+     lastMoved=os.clock() lastPosition=r.Position
+    end
+    if (r.Position-lastPosition).Magnitude>0.25 then
+     lastPosition=r.Position lastMoved=os.clock()
+    end
+    local stuck=os.clock()-lastMoved>1.1
+    if stuck and not retriedJump then
+     retriedJump=true
+     if tryStepJump(goal,c,h,r) then lastMoved=os.clock() lastGoal=nil end
+    end
+    if stuck and not stepped and os.clock()-lastMoved>1.8 then
+     stepped=true
+     if trySidestep(goal,c,h,r,id) then
+      lastMoved=os.clock() lastGoal=nil lastPosition=r.Position
+     end
+    end
+    if obstructed or os.clock()-lastMoved>2.8 or os.clock()-began>12 or os.clock()>totalDeadline then
+     failed=true state.stats.stalls+=1 state.lastFailure="blocked or stalled route"
+     table.insert(blockedGoals,goal)
+     break
+    end
+    task.wait(0.1)
+   end
+   if failed then
     release()
-    if not failed and available(p) and inRange(p,r) and sight(p,r,c) then return true end
+    retreat(lastSafe,c,h,r,id)
+    break
+   end
+   lastSafe=r.Position
+   release()
+   if state.opportunistic then return true end
+   if available(p) and inRange(p,r) and sight(p,r,c) then return true end
   end
  end
  return false
@@ -449,6 +517,15 @@ local function cycle(id)
  if not state.mining and not state.harvesting then report("waiting","Select Gather Ores or Gather Crops") return end
  local c,_,r=character()
  if c:GetAttribute("Flying") then state.status="Land to resume gathering" release() return end
+ -- Harvest anything already in reach before planning a trip.
+ local here=reachableNode(r,c,8)
+ if here then
+  state.target=here.Parent.Parent.Name
+  report("interacting","Interacting: "..state.target)
+  interact(here,id)
+  release()
+  return
+ end
  local candidates={}
  for p in pairs(nodes) do
   if available(p) then
@@ -473,16 +550,20 @@ local function cycle(id)
   if not ready(id) then release() return end
   c=player.Character
   if c and c:GetAttribute("Flying") then state.status="Land to resume gathering" return end
-  if groundRoute(p,id) then
-   interact(p,id)
+  local function harvestNow()
+   local target=state.opportunistic
+   state.opportunistic=nil
+   local _,_,now=character()
+   if target and now and available(target) and inRange(target,now) and sight(target,now,c) then
+    state.target=target.Parent.Parent.Name
+    interact(target,id)
+   else
+    interact(p,id)
+   end
    release()
-   return
   end
-  if ready(id) and available(p) and flightRoute(p,id) and groundRoute(p,id) then
-   interact(p,id)
-   release()
-   return
-  end
+  if groundRoute(p,id) then harvestNow() return end
+  if ready(id) and available(p) and flightRoute(p,id) and groundRoute(p,id) then harvestNow() return end
   if ready(id) and available(p) then cooldown(p,state.lastFailure or "no usable route") end
  end
  release()
