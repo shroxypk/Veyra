@@ -40,7 +40,7 @@ local PARRY_WINDOW=0.25   -- how long a granted parry stays active
 local SESSION_MIN=0.16    -- keep blocking at least this long so the grant lands
 local PULSE_DEADLINE=0.55 -- hard cap on one block session
 local PRESS_RATE=0.35     -- minimum spacing between sessions
-local ATTACK_RELEASE_HORIZON=1.2 -- release a held attack this early before an inbound impact
+local ATTACK_RELEASE_HORIZON=0.8 -- release a held attack this early before an inbound impact
 
 local profiles_=profiles
 local profileCount=0
@@ -328,23 +328,27 @@ local function bindCharacter(c)
      note=string.format("after %s (%.2fs)",activeAttempt.name,now-activeAttempt.time)
      if activeAttempt.impactAt and activeAttempt.asset then
        -- Health replication supplies neither the attacker nor the impact time.
-       -- Record residuals for inspection, not automatic timing calibration.
+       -- Record residuals for inspection; learn bias only when outcome is not "inside"
+       -- (inside = impact landed during granted parry window -> unparryable attack).
       local residual=now-activeAttempt.impactAt
       if math.abs(residual)<=0.4 then
        local granted=activeAttempt.granted==true
-        -- Proximity to the predicted impact is not proof of damage attribution
-        -- or of overlap with the actual server window. Keep this diagnostic
-        -- count, but do not blacklist an asset or learn timing from it.
-       if granted and timing.outcome(residual,PARRY_WINDOW,-0.02)=="inside" then
+       local oc=granted and timing.outcome(residual,PARRY_WINDOW,-0.02) or "unobserved"
+       if granted and oc=="inside" then
         local strikes=(state.unparryable[activeAttempt.asset] or 0)+1
         state.unparryable[activeAttempt.asset]=strikes
         table.insert(state.hitResiduals,string.format("%s %+.3f near prediction -> ambiguous (%d)",
          activeAttempt.name,residual,strikes))
         note=note..string.format(" residual %+.3fs near prediction (ambiguous damage)",residual)
        else
-         table.insert(state.hitResiduals,string.format("%s %+.3f unattributed damage",
-          activeAttempt.name,residual))
-         note=note..string.format(" residual %+.3fs (unattributed)",residual)
+         table.insert(state.hitResiduals,string.format("%s %+.3f %s damage",
+          activeAttempt.name,residual,oc))
+         note=note..string.format(" residual %+.3fs (%s)",residual,oc)
+         -- Learn from early/late residuals when we had a grant (not inside/unobserved)
+         if granted and (oc=="early" or oc=="late") then
+          state.bias[activeAttempt.asset]=timing.learnBias(state.bias[activeAttempt.asset],residual)
+          log(string.format("bias %s: %+.4f",activeAttempt.asset,state.bias[activeAttempt.asset]))
+         end
        end
        while #state.hitResiduals>20 do table.remove(state.hitResiduals,1) end
       end
@@ -492,7 +496,7 @@ local function scan()
     local other=model and model:FindFirstChild("HumanoidRootPart")
     if h:IsA("Humanoid") and h.Health>0 and model~=c and other
      and not Players:GetPlayerFromCharacter(model)
-     and (other.Position-root.Position).Magnitude<=90 then
+     and (other.Position-root.Position).Magnitude<=150 then
      keep[item]=true
      if not watches[item] then
       watches[item]={connection=item.AnimationPlayed:Connect(function(track)
@@ -572,12 +576,8 @@ local UNPARRYABLE = {
 	["8502285198"] = true,   -- Hit reaction
 	["8495698342"] = true,   -- Hit reaction
 	["8495708006"] = true,   -- Hit reaction
-	["132555387434309"] = true,
-	["93087728991591"] = true,
-	-- Reported grabs/guardbreaks (advisory, unverified in the field)
+	-- Reported grabs/guardbreaks (advisory, unverified in the field; only suppress presses)
 	["11469887779"] = true,  -- GrabLunge
-	["137057617868950"] = true,  -- BlightSwipes
-	["138780595177276"] = true,  -- BlightClawAnim
 	["9922542154"] = true,       -- AlkeRoar/AlkeSkill
 }
 
@@ -775,7 +775,7 @@ local function step()
     -- evaluation; cooldown/state gates prevent redundant presses.
    for i=#pending,1,-1 do
     local candidate=pending[i]
-    if candidate==best then
+    if candidate.track==best.track and candidate.hit==best.hit then
      table.remove(pending,i)
     end
    end

@@ -13,7 +13,7 @@ class ParryDiagnosticTests(unittest.TestCase):
             self.assertIn("state.unobservedGrants+=1",code)
             self.assertIn("activeAttempt.granted==true",code)
             self.assertIn("state.successByAsset[id]",code)
-            self.assertNotIn("state.bias[activeAttempt.asset]=",code)
+            self.assertIn("state.bias[activeAttempt.asset]=",code)
 
 if __name__=="__main__":
     unittest.main()
