@@ -8,12 +8,6 @@ ROOT = Path(__file__).resolve().parents[1]
 def build(check=False):
     source = ROOT / "src"
     runtime = (source / "runtime.lua").read_text(encoding="utf-8")
-    gather_dep = 'loadstring(readfile("Veyra/src/gather.lua"),"gather.lua")()'
-    if (source / "gather.lua").exists():
-        if runtime.count(gather_dep) != 1:
-            raise ValueError("Expected exactly one gathering dependency")
-        gather = (source / "gather.lua").read_text(encoding="utf-8")
-        runtime = runtime.replace(gather_dep, "(function()\n" + gather + "\nend)()")
     minigames = (source / "minigames.lua").read_text(encoding="utf-8")
     quest = (source / "quest_assist.lua").read_text(encoding="utf-8") if (source / "quest_assist.lua").exists() else ""
     boss_alerts = (source / "boss_alerts.lua").read_text(encoding="utf-8") if (source / "boss_alerts.lua").exists() else ""

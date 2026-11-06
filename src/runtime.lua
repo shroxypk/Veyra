@@ -5,7 +5,6 @@ if G.VeyraMinigames then G.VeyraMinigames.stop() end
 if G.VeyraQuestAssist then G.VeyraQuestAssist.stop() end
 if G.VeyraParry then G.VeyraParry.stop() end
 if G.VeyraBossAlerts then G.VeyraBossAlerts.stop() end
-if G.VeyraGather then G.VeyraGather.stop() end
 if G.VeyraDodge then G.VeyraDodge.stop() end
   -- Legacy guard: builds before v2 kept a Kill Aura module here. Reloading the
   -- hub must release its held mouse button, or it keeps swinging on its own.
@@ -87,12 +86,9 @@ startModule("minigames",function() loadstring(readfile("Veyra/src/minigames.lua"
 startModule("quest assist",function() loadstring(readfile("Veyra/src/quest_assist.lua"),"quest_assist.lua")() end)
 startModule("boss alerts",function() loadstring(readfile("Veyra/src/boss_alerts.lua"),"boss_alerts.lua")() end)
 startModule("auto parry",function() loadstring(readfile("Veyra/src/auto_parry.lua"),"auto_parry.lua")() end)
-startModule("gathering",function() loadstring(readfile("Veyra/src/gather.lua"),"gather.lua")() end)
 startModule("auto dodge",function() loadstring(readfile("Veyra/src/auto_dodge.lua"),"auto_dodge.lua")() end)
 local AD = G.VeyraDodge
 H.autoDodge=AD
-local GA=G.VeyraGather
-H.gather=GA
 local AP = G.VeyraParry
 H.parry=AP
 local QA = G.VeyraQuestAssist
@@ -296,7 +292,7 @@ local function selectTab(name)
   tabButtons[pageName].TextColor3=selected and palette.onAccent or palette.muted
  end
 end
-for index,name in ipairs({"Combat","Gathering","Movement","Guidance","Settings"}) do
+for index,name in ipairs({"Combat","Movement","Guidance","Settings"}) do
  local page=new("ScrollingFrame",{Name=name,Position=UDim2.fromOffset(0,44),Size=UDim2.new(1,0,1,-44),Visible=false,BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=4,ScrollBarImageColor3=palette.line,CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,ScrollingDirection=Enum.ScrollingDirection.Y,ElasticBehavior=Enum.ElasticBehavior.Never},bodyHost)
  new("UIListLayout",{Padding=UDim.new(0,9),SortOrder=Enum.SortOrder.LayoutOrder},page)
  local button=new("TextButton",{Name=name,Position=UDim2.new((index-1)/5,2,0,0),Size=UDim2.new(1/5,-4,1,0),BackgroundColor3=palette.panel,BorderSizePixel=0,Text=name,Font=Enum.Font.GothamMedium,TextSize=10,TextColor3=palette.muted,AutoButtonColor=false},tabBar)
@@ -432,7 +428,7 @@ local function bindHotkey(actionKey,valueLabel)
  valueLabel.Text="PRESS A KEY"
  toast("Rebind "..actionKey,"Any key binds · Esc cancels")
 end
-body=pages.Gathering
+body=pages.Combat
 heading("Minigames")
 toggle("Auto Minigames","Solves every harvest + mining minigame for you",false,
  function(on) if MG then MG.setEnabled(on) end end,
@@ -450,18 +446,6 @@ local _,resetRange=stepper("Parry Range","Only react to attackers inside this di
  function(v) return string.format("%.0f studs",v) end,
  function(v) if AP then AP.range=v end config.set("parry",{range=v}) end)
 toggle("Boss Attack Alerts","Adaptive cues for profiled boss windups",false,function(on) if BA then BA.setEnabled(on) end end,function() return BA and BA.enabled end)
-body=pages.Gathering
-heading("Resource Navigation")
-toggle("Auto Gather","Navigate to resources · requires Auto Minigames",false,
- function(on) if GA then GA.setEnabled(on) end end,function() return GA and GA.enabled end)
-toggle("Gather Ores","Include mining nodes",true,
- function(on) if GA then GA.mining=on end end,function() return GA and GA.mining end)
-toggle("Gather Crops","Include harvesting nodes",true,
- function(on) if GA then GA.harvesting=on end end,function() return GA and GA.harvesting end)
-toggle("Gather Broom Routes","Experimental · clear flight corridors · controls camera",false,
- function(on) if GA then GA.broom=on end end,function() return GA and GA.broom end)
-stepper("Gather Radius","Search currently loaded resources nearby",50,1000,50,300,
- function(v) return string.format("%.0f studs",v) end,function(v) if GA then GA.radius=v end end)
 body=pages.Guidance
 heading("Quest Guidance")
 toggle("Quest Assistance","Draggable tracker · progress · marker controls",false,

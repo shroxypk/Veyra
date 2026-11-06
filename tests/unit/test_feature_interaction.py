@@ -13,7 +13,7 @@ def read(name):
 class FeatureInteractionTests(unittest.TestCase):
     def test_modules_shipped(self):
         runtime = read("src/runtime.lua")
-        for name in ("minigames", "quest assist", "boss alerts", "auto parry"):
+        for name in ("minigames", "quest assist", "boss alerts", "auto parry", "auto dodge"):
             self.assertIn(f'startModule("{name}"', runtime)
         # The removed aura must not come back through a module start.
         self.assertNotIn("kill_aura", runtime)
@@ -23,6 +23,10 @@ class FeatureInteractionTests(unittest.TestCase):
         self.assertNotIn("build_advisor", runtime)
         self.assertNotIn("Build Advisor", runtime)
         self.assertFalse((ROOT / "src/build_advisor.lua").exists())
+        # Gathering was removed at the user's request; it must not return.
+        self.assertNotIn("gathering", runtime)
+        self.assertNotIn("startModule(\"gathering\"", runtime)
+        self.assertFalse((ROOT / "src/gather.lua").exists())
 
     def test_navigation_and_minigames_have_separate_input_ownership(self):
         owners = {}
@@ -30,11 +34,7 @@ class FeatureInteractionTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             if "SendMouseMoveEvent" in text or "SendKeyEvent" in text:
                 owners[path.name] = True
-        self.assertEqual(sorted(owners), ["gather.lua", "minigames.lua"])
-        gather = read("src/gather.lua")
-        self.assertNotIn("Enum.KeyCode.Space", gather)
-        self.assertNotIn("mg.setEnabled", gather)
-        self.assertIn("sessionLive(mg)", gather)
+        self.assertEqual(sorted(owners), ["minigames.lua"])
         # Space taps happen only while a round is live and never while typing.
         mg = read("src/minigames.lua")
         self.assertIn("if not state.enabled or state.paused or UIS:GetFocusedTextBox() or not state.active then", mg)
