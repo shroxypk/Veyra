@@ -2480,7 +2480,8 @@ end
 local function attackLike(track)
  if track.Looped then return false end
  local length=track.Length or 0
- if length<0.2 or length>3.5 then return false end
+ -- Boss ultimates and long skills can exceed 3.5s; allow up to 6s for profiled assets
+ if length<0.2 or length>6 then return false end
  local animation=track.Animation
  if not animation then return false end
  local id=animation.AnimationId:match("%d+")
@@ -2588,7 +2589,9 @@ local function derive(id,name)
   if not state.alive or not parsed or #frames<2 then return end
   local hits=deriveHits(frames,length)
   if not hits then return end
-  derived[id]={name=name or ("asset "..id),length=length,hits=hits,derived=true}
+  local profile={name=name or ("asset "..id),length=length,hits=hits,derived=true}
+  if not validProfile(profile) then return end
+  derived[id]=profile
   deriveDirty=true
   state.derived=(state.derived or 0)+1
   local times={}
@@ -2780,8 +2783,10 @@ local function observe(model,track)
  if not profile and id then
   local attack,animId=attackLike(track)
   if attack and animId then derive(animId,track.Animation.Name) end
+  -- Always attempt derivation for known server animations, even if attackLike filters them
   if serverAnimations[id] and not state.unknownAssets[id] then
    state.unknownAssets[id]=true state.unknown+=1 log("unsupported melee asset "..id)
+   if not deriveTried[id] then derive(id,track.Animation.Name) end
   end
  end
  if not profile then return end
@@ -2863,6 +2868,17 @@ local MOB_REACH = {
 	["8314692364"] = 10,       -- HammerDown
 	-- Alke (boss)
 	["9924282016"] = 10,       -- AlkeCombo
+	-- Thief / Bandit common
+	["9839879425"] = 8,        -- BanditAnimation (Thief uses)
+	-- Zombie
+	["11892996649"] = 8,       -- Zombie1
+	["11893001175"] = 8,       -- Zombie2
+	["11893004134"] = 8,       -- ZombieKnockback
+	-- Golem
+	["14158890923"] = 9,       -- Golem 1
+	["14158953103"] = 9,       -- Golem 2
+	-- Fell Hunter
+	["125612125612125"] = 9,   -- Fell Hunter (placeholder - will use name fallback)
 }
 
 local DEFAULT_REACH = 8
@@ -2874,6 +2890,11 @@ local function getReach(candidate)
 	if name:find("Guard") or name:find("Sentinel") then return 9 end
 	if name:find("Knight") or name:find("Brute") then return 10 end
 	if name:find("Boss") or name:find("Alke") or name:find("Blight") then return 12 end
+	if name:find("Thief") or name:find("Bandit") then return 8 end
+	if name:find("Wolf") then return 8 end
+	if name:find("Zombie") then return 8 end
+	if name:find("Golem") then return 9 end
+	if name:find("Fell") or name:find("Hunter") then return 9 end
 	return DEFAULT_REACH
 end
 
@@ -2896,9 +2917,11 @@ local UNPARRYABLE = {
 
 local function isUnparryable(candidate)
 	if candidate.id and UNPARRYABLE[candidate.id] then return true end
-	-- Heuristic: grab/lunge names often unparryable
+	-- Heuristic: grab/lunge/throw/slam/stomp names often unparryable
 	local n = (candidate.name or ""):lower()
-	if n:find("grab") or (n:find("lunge") and not n:find("slash")) then return true end
+	if n:find("grab") or n:find("throw") or n:find("slam") or n:find("stomp")
+	 or n:find("crush") or n:find("smash") or n:find("ground pound")
+	 or (n:find("lunge") and not n:find("slash")) then return true end
 	return false
 end
 
