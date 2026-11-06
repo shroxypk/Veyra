@@ -320,7 +320,6 @@ if G.VeyraQuestAssist then G.VeyraQuestAssist.stop() end
 if G.VeyraParry then G.VeyraParry.stop() end
 if G.VeyraBossAlerts then G.VeyraBossAlerts.stop() end
 if G.VeyraGather then G.VeyraGather.stop() end
-if G.VeyraSkillRotation then G.VeyraSkillRotation.stop() end
 if G.VeyraDodge then G.VeyraDodge.stop() end
   -- Legacy guard: builds before v2 kept a Kill Aura module here. Reloading the
   -- hub must release its held mouse button, or it keeps swinging on its own.
@@ -2875,8 +2874,11 @@ local function getReach(candidate)
 	return DEFAULT_REACH
 end
 
--- Unparryable moves: animation IDs that should never be parried (grabs, guardbreaks, etc.)
--- Verified from client animation folders and wiki. Do not guess.
+-- Clips that must never be treated as an attack. The reaction entries are
+-- structural (they are the game's own parry/dodge/hit clips, never a mob swing);
+-- the rest are reported grabs/guardbreaks and are advisory, not field-verified.
+-- This list only ever *suppresses* a press, so an unverified entry can cost a
+-- parry but can never invent one.
 local UNPARRYABLE = {
 	["14417052527"] = true,  -- Parry reaction
 	["13355016261"] = true,  -- Dodge
@@ -2886,12 +2888,10 @@ local UNPARRYABLE = {
 	["8495708006"] = true,   -- Hit reaction
 	["132555387434309"] = true,
 	["93087728991591"] = true,
-	-- Mushknight grab (unparryable per wiki - guardbreak)
+	-- Reported grabs/guardbreaks (advisory, unverified in the field)
 	["11469887779"] = true,  -- GrabLunge
-	-- Lizard Boss (guardbreak moves)
 	["137057617868950"] = true,  -- BlightSwipes
 	["138780595177276"] = true,  -- BlightClawAnim
-	-- Alke boss (unparryable skills)
 	["9922542154"] = true,       -- AlkeRoar/AlkeSkill
 }
 
@@ -2913,39 +2913,6 @@ local function hasLOS(root, other)
 	return result == nil or (result.Instance and result.Instance:IsDescendantOf(other.Parent))
 end
 
--- Priority score: lower = higher priority
--- Factors: distance, HP%, quest target, is using skill, has unparryable moves
-local function priorityScore(candidate, root, now)
-	local model = candidate.model
-	local h = model:FindFirstChildOfClass("Humanoid")
-	local other = model:FindFirstChild("HumanoidRootPart")
-	if not h or not other then return math.huge end
-
-	local delta = root.Position - other.Position
-	local dist = delta.Magnitude
-	local hpPct = h.MaxHealth > 0 and (h.Health / h.MaxHealth) or 1
-
-	local score = dist * 1.0           -- closer first
-	score += (1 - hpPct) * 30          -- lower HP first
-	score += hpPct * 5                 -- slightly prefer damaged
-
-	-- Quest target bonus
-	if QA and QA.selected and model.Name:find(QA.selected) then score -= 50 end
-
-	-- Skill-user gets priority (anti-gank: only one uses skills)
-	local usingSkill = h:GetAttribute("State_UsingSkill") == true
-		or h:GetAttribute("State_SkillActive") == true
-	if usingSkill then score -= 100 end
-
-	-- Unparryable penalty
-	if isUnparryable(candidate) then score += 200 end
-
-	-- LOS penalty
-	if not hasLOS(root, other) then score += 150 end
-
-	return score
-end
-
 local function incoming(candidate,root,remaining)
  local model=candidate.model
  local h=model:FindFirstChildOfClass("Humanoid")
@@ -2961,8 +2928,10 @@ local function incoming(candidate,root,remaining)
  if math.abs(delta.Y)>10 then return false,"height" end
  local direction=delta.Unit
  local closing=(other.AssemblyLinearVelocity-root.AssemblyLinearVelocity):Dot(direction)
- -- Use configured parry range (state.range) for the UI slider; fall back to mob reach if not set
- local effectiveRange = state.range or reach
+ -- The slider caps how far away a reaction is allowed, but it must never
+ -- stretch a swing beyond the mob's real reach: pressing at 14 studs for an
+ -- 8-stud dagger whiffs the parry and burns the ~1s lockout.
+ local effectiveRange = math.min(state.range or reach, reach+2)
  if not timing.inRange(distance,closing,remaining,effectiveRange) then return false,string.format("range %.1f/%.1f",distance,effectiveRange) end
  if not isCloseSpin and other.CFrame.LookVector:Dot(direction)<0.25 then return false,"attacker facing away" end
  if not hasLOS(root, other) then return false,"no LOS" end
@@ -2997,7 +2966,7 @@ local function step()
  local root,reason=ready()
  local available=root~=nil
  local myRoot=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
- local nearestInbound,nearestInboundName
+ local nearestInbound,nearestInboundName,nearestInboundId
  local notBefore=-math.huge
  if root then
   state.status=string.format("Parry · %d inputs · %d parried · %d hit",state.attempts,state.confirmed,state.damageEvents)
@@ -3024,7 +2993,12 @@ local function step()
   if state.blockedReason~=reason then log("waiting: "..reason) end
   state.blockedReason=reason
  end
- if session then return end
+ if session then
+  -- Published for Auto Dodge: a session is in flight, so a roll would cancel it.
+  state.pressing=true state.impactIn=nil state.impactId=nil
+  return
+ end
+ state.pressing=false
  -- No idle calibration: a whiff can impose recovery lag. Only press on profiles.
  -- No defensive hold: unknown attacks may be unparryable or guardbreaking.
   -- Calibration is optional: a pending attack must never be blocked by it.
@@ -3045,6 +3019,7 @@ local function step()
      if ok2 and inb and (not nearestInbound or remaining<nearestInbound) then
       nearestInbound=remaining
       nearestInboundName=candidate.name
+      nearestInboundId=candidate.id
      end
     end
    -- Learned per-asset shift: runtime misses override the baked measurement.
@@ -3071,6 +3046,10 @@ local function step()
    end
   end
  end
+ -- Published for Auto Dodge: the soonest profiled impact this module knows
+ -- about, and whether its own gates let it press right now.
+ state.impactIn=nearestInbound
+ state.impactId=nearestInboundId
   -- Release a held attack early: the server keeps Attacking until the current
   -- swing finishes, and CanParry is false while Attacking, so M1 must drop
   -- ahead of the press deadline (which is only lead+window before impact).
@@ -3174,6 +3153,9 @@ function state.stop()
  state.alive=false
  if G.VeyraParry==state then G.VeyraParry=nil end
 end
+-- Auto Dodge asks this before rolling: an animation this module has a profile
+-- for is left to parry, everything else is dodge's problem.
+function state.knows(id) return id~=nil and (profiles_[id]~=nil or derived[id]~=nil) end
 function state.isWorking() return worker~=nil end
 return state
 
@@ -3360,6 +3342,41 @@ local function tryStepJump(goal,c,h,r)
  state.stats.jumps=(state.stats.jumps or 0)+1
  return true
 end
+-- MoveTo can stall against doorframes and thin props that the pathfinder still
+-- considers walkable. One short sideways step usually frees the capsule; it is
+-- attempted once per waypoint and only onto real, non-water floor.
+local function trySidestep(goal,c,h,r,id)
+ if h.FloorMaterial==Enum.Material.Air then return false end
+ local dx,dz=goal.X-r.Position.X,goal.Z-r.Position.Z
+ local magnitude=math.sqrt(dx*dx+dz*dz)
+ if magnitude<1 then return false end
+ local sideX,sideZ=-dz/magnitude,dx/magnitude
+ local origin=CFrame.new(r.Position+Vector3.new(0,0.5,0))
+ local size=Vector3.new(2,3,2)
+ local function clear(direction)
+  return workspace:Blockcast(origin,size,direction,params(c))==nil
+ end
+ local function floorAt(offset)
+  local point=r.Position+Vector3.new(sideX*offset,0,sideZ*offset)
+  local hit=workspace:Raycast(point+Vector3.new(0,2,0),Vector3.new(0,-9,0),params(c))
+  if hit and hit.Material~=Enum.Material.Water and hit.Normal.Y>=0.7 then return hit.Position end
+ end
+ local point,direction
+ for _,offset in ipairs({3,-3,1.5,-1.5}) do
+  local candidate=r.Position+Vector3.new(sideX*offset,0,sideZ*offset)
+  local delta=candidate-r.Position
+  if clear(delta) then
+   local floor=floorAt(offset)
+   if floor then point,direction=floor,floor-r.Position break end
+  end
+ end
+ if not point then return false end
+ report("recovering","Stepping around obstruction")
+ walking=h h:MoveTo(point)
+ local untilTime=os.clock()+0.7
+ while ready(id) and player.Character==c and os.clock()<untilTime do task.wait(0.1) end
+ return true
+end
 local function groundRoute(p,id)
  local c,h,r=character()
  if not c or not h or not r then return false end
@@ -3371,12 +3388,16 @@ local function groundRoute(p,id)
   if inRange(p,r) and sight(p,r,c) then return true end
   report("planning","Planning route: "..state.target.." ("..attempt.."/3)")
   local options={}
-  for index=1,8 do
-   if not rejected[index] then
-    local angle=(index-1)*math.pi/4
-    local point=standingPoint(p,Vector3.new(math.cos(angle)*margin,0,math.sin(angle)*margin),c,h,r)
-    if point then table.insert(options,{index=index,point=point,distance=(point-r.Position).Magnitude}) end
-   end
+  local function addApproach(index,angle,radius)
+   if rejected[index] then return end
+   local point=standingPoint(p,Vector3.new(math.cos(angle)*radius,0,math.sin(angle)*radius),c,h,r)
+   if point then table.insert(options,{index=index,point=point,distance=(point-r.Position).Magnitude}) end
+  end
+  for index=1,8 do addApproach(index,(index-1)*math.pi/4,margin) end
+  -- Ore veins in cliffs, walls and tree trunks can leave all eight inner points
+  -- occupied. Widen the ring before declaring the node unreachable.
+  if #options<2 then
+   for index=9,16 do addApproach(index,(index-9)*math.pi/4+math.pi/8,margin+3) end
   end
   table.sort(options,function(a,b) return a.distance<b.distance end)
   local chosen
@@ -3393,7 +3414,12 @@ local function groundRoute(p,id)
     local length,previous,valid=0,r.Position-Vector3.new(0,rootOffset(c,h,r),0),true
     for _,waypoint in ipairs(waypoints) do
      length+=(waypoint.Position-previous).Magnitude
-     if previous.Y-waypoint.Position.Y>8 then valid=false end
+     -- A long descent used to invalidate the whole path, which stranded every
+     -- node below a ledge. Accept it when there is real floor to land on.
+     if previous.Y-waypoint.Position.Y>8 then
+      local landing=workspace:Raycast(waypoint.Position+Vector3.new(0,2,0),Vector3.new(0,-30,0),params(c))
+      if not landing or landing.Material==Enum.Material.Water or landing.Normal.Y<0.7 then valid=false end
+     end
      for _,goal in ipairs(blockedGoals) do if (waypoint.Position-goal).Magnitude<3 then valid=false end end
      previous=waypoint.Position
     end
@@ -3419,25 +3445,57 @@ local function groundRoute(p,id)
      state.phase="walking"
      state.status=string.format("Walking to %s · %d/%d",state.target,i,#chosen.waypoints)
      h:MoveTo(waypoint.Position)
-     if waypoint.Action==Enum.PathWaypointAction.Jump then h.Jump=true end
      local began,lastProgress,best=os.clock(),os.clock(),math.huge
-     local retriedJump=false
+     local retriedJump,stepped=false,false
+     local lastMoved,lastPosition=os.clock(),r.Position
+     local nextWaypoint=chosen.waypoints[i+1]
      local function reached()
       local delta=r.Position-waypoint.Position
        -- Humanoid MoveTo itself completes within roughly one stud.
        local rootHeight=rootOffset(c,h,r)
-       return Vector3.new(delta.X,0,delta.Z).Magnitude<=1.25 and math.abs(delta.Y-rootHeight)<=2.5
+       if Vector3.new(delta.X,0,delta.Z).Magnitude<=1.25 and math.abs(delta.Y-rootHeight)<=2.5 then return true end
+       -- MoveTo cannot always land on the exact stud. Once the following
+       -- waypoint is clearly closer than this one, we have passed it.
+       if nextWaypoint then
+        local here=Vector3.new(delta.X,0,delta.Z).Magnitude
+        local ahead=r.Position-nextWaypoint.Position
+        if Vector3.new(ahead.X,0,ahead.Z).Magnitude<here-0.75 then return true end
+       end
+       return false
      end
      while not reached() do
       if not ready(id) or not available(p) or player.Character~=c then failed=true break end
       if inRange(p,r) and sight(p,r,c) then break end
       local distance=(r.Position-waypoint.Position).Magnitude
       if distance<best-0.35 then best=distance lastProgress=os.clock() end
-      if not retriedJump and os.clock()-lastProgress>0.65 then
-       retriedJump=true
-       if tryStepJump(waypoint.Position,c,h,r) then lastProgress=os.clock() end
+      -- Displacement, not just clock time: a capsule pinned on a doorframe
+      -- stops moving long before the 1.25s timeout would fire.
+      if (r.Position-lastPosition).Magnitude>0.35 then
+       lastPosition=r.Position lastMoved=os.clock()
       end
-      if obstructed or os.clock()-lastProgress>1.25 or os.clock()-began>6 or os.clock()>totalDeadline then
+      local stuck=os.clock()-lastMoved>0.6
+      if waypoint.Action==Enum.PathWaypointAction.Jump and not retriedJump and distance<=4 then
+       retriedJump=true
+       if h.FloorMaterial~=Enum.Material.Air
+        and not workspace:Raycast(r.Position,Vector3.new(0,6,0),params(c)) then
+        h.Jump=true
+        state.stats.jumps=(state.stats.jumps or 0)+1
+        lastProgress=os.clock() lastMoved=os.clock()
+       end
+      end
+      if stuck and not retriedJump then
+       retriedJump=true
+       if tryStepJump(waypoint.Position,c,h,r) then
+        lastProgress=os.clock() lastMoved=os.clock()
+       end
+      end
+      if stuck and not stepped and os.clock()-lastProgress>0.9 then
+       stepped=true
+       if trySidestep(waypoint.Position,c,h,r,id) then
+        lastProgress=os.clock() lastMoved=os.clock()
+       end
+      end
+      if obstructed or os.clock()-lastProgress>1.6 or os.clock()-began>6 or os.clock()>totalDeadline then
        failed=true state.stats.stalls+=1 state.lastFailure="blocked or stalled route"
        table.insert(blockedGoals,waypoint.Position)
        break
@@ -3563,20 +3621,33 @@ local function cycle(id)
   end
  end
  table.sort(candidates,function(a,b) return a.distance<b.distance end)
- local selected=candidates[1]
- if not selected then report("waiting","Waiting for available resources · skipped "..state.stats.skipped) return end
- local p=selected.prompt
- state.target=p.Parent.Parent.Name
- state.lastFailure=nil
- report("planning","Routing: "..state.target)
- if state.broom and selected.distance>100 then flightRoute(p,id) end
- if not ready(id) then release() return end
- c=player.Character
- if c and c:GetAttribute("Flying") then state.status="Land to resume gathering" return end
- if groundRoute(p,id) then interact(p,id)
- elseif ready(id) and available(p) then
-   if flightRoute(p,id) and groundRoute(p,id) then interact(p,id)
-   elseif ready(id) and available(p) then cooldown(p,state.lastFailure or "no usable route") end
+ if #candidates==0 then report("waiting","Waiting for available resources · skipped "..state.stats.skipped) return end
+ -- One unreachable node used to burn the whole cycle. Try the next nearest
+ -- candidates instead, bounded so a bad region cannot stall the loop.
+ local deadline=os.clock()+75
+ local tried=0
+ for _,candidate in ipairs(candidates) do
+  if tried>=3 or os.clock()>deadline or not ready(id) then break end
+  tried+=1
+  local p=candidate.prompt
+  state.target=p.Parent.Parent.Name
+  state.lastFailure=nil
+  report("planning","Routing: "..state.target)
+  if state.broom and candidate.distance>100 then flightRoute(p,id) end
+  if not ready(id) then release() return end
+  c=player.Character
+  if c and c:GetAttribute("Flying") then state.status="Land to resume gathering" return end
+  if groundRoute(p,id) then
+   interact(p,id)
+   release()
+   return
+  end
+  if ready(id) and available(p) and flightRoute(p,id) and groundRoute(p,id) then
+   interact(p,id)
+   release()
+   return
+  end
+  if ready(id) and available(p) then cooldown(p,state.lastFailure or "no usable route") end
  end
  release()
 end
@@ -3614,322 +3685,274 @@ for _,v in ipairs(workspace:GetDescendants()) do register(v) end
 return state
 
 end)() end)
-startModule("auto skill rotation",function() local function __startSkillRotation()
--- Auto Skill Rotation: fires Magic.Cast / Tools.BasicTechnique on cooldown.
-local G=getgenv()
-if G.VeyraSkillRotation then G.VeyraSkillRotation.stop() end
-local storage=game:GetService("ReplicatedStorage")
-local player=game:GetService("Players").LocalPlayer
-local HttpService=game:GetService("HttpService")
-
-local state={alive=true,enabled=false,magic={},weapon={},status="Skill Rotation off"}
-G.VeyraSkillRotation=state
-
-local connections={}
-local worker
-local magicPacket,weaponPacket
-
-local SKILL_DB={
-	Light={"DivineField","BlindingRush","Conviction","AerialAssault","SlashesOfLight","FallingLance"},
-	Flame={"FireStomp","BindingFlame","FlameTrap","ScorchingBarrage","BurstPistol","FieryGrapple"},
-	Wind={"Tornado","RushingTempest","WindRush","Palm","WindStomp","Blade"},
-	Lightning={"LightningShroud","VoltSurge","ElectroBeam","LightningBarrage","ThunderStrike","DragonImpact"},
-	Shadow={"ShadowAnnihilation","DarkCyclone","ViciousAssault","SavageMaw","UmbraSurge","DarkHaste"},
-	Beast={"PrimalRoar","HolyHunting","FeralImpact","SavageMaul","ApexClaw","BeastClaw"},
-	Time={"TimeStop","Rewind","ChronoSurge","SlowZone","BlitzSkill","PalmSkill"},
-}
-
-local function log(msg)
-	table.insert(state.log or {},string.format("%.3f %s",os.clock(),msg))
-	if #(state.log or {})>60 then table.remove(state.log,1) end
-end
-
-local function getMagic()
-	local c=player.Character
-	if not c then return end
-	local magic=c:GetAttribute("Magic")
-	if not magic then return end
-	return magic
-end
-
-local function getWeaponSkill()
-	local c=player.Character
-	if not c then return end
-	local tool=c:FindFirstChildOfClass("Tool")
-	if not tool then return end
-	local skill=tool:GetAttribute("Skill")
-	if not skill then return end
-	return skill
-end
-
-local function getCooldowns()
-	local c=player.Character
-	if not c then return {} end
-	local info=c:FindFirstChild("CombatInfo")
-	if not info then return {} end
-	local out={}
-	for _,child in ipairs(info:GetChildren()) do
-		if child:IsA("NumberValue") and child.Value>0 then
-			out[child.Name]=child.Value
-		end
-	end
-	return out
-end
-
-local function getSkillMetadata(magicType,skillName)
-	if not magicType then return nil end
-	local data=SKILL_DB[magicType]
-	if not data then return nil end
-	for _,s in ipairs(data) do
-		if s==skillName then return {magic=magicType,skill=skillName} end
-	end
-	return nil
-end
-
-local function buildSkillList()
-	local list={}
-	local magicType=getMagic()
-	if magicType then
-		for _,skill in ipairs(SKILL_DB[magicType] or {}) do
-			table.insert(list,{type="magic",skill=skill,magic=magicType})
-		end
-	end
-	local weaponSkill=getWeaponSkill()
-	if weaponSkill then
-		table.insert(list,{type="weapon",skill=weaponSkill})
-	end
-	state.skillList=list
-	return list
-end
-
-local function sendMagic(skill)
-	if not magicPacket then return false end
-	local ok,err=pcall(function() magicPacket.send({Skill=skill}) end)
-	if not ok then log("magic send: "..tostring(err)) end
-	return ok
-end
-
-local function sendWeapon(skill)
-	if not weaponPacket then return false end
-	local ok,err=pcall(function() weaponPacket.send({Skill=skill}) end)
-	if not ok then log("weapon send: "..tostring(err)) end
-	return ok
-end
-
-local function step()
-	if not state.enabled or not state.alive then return end
-	local c=player.Character
-	if not c then return end
-	local humanoid=c:FindFirstChildOfClass("Humanoid")
-	if not humanoid or humanoid.Health<=0 then return end
-
-	local list=state.skillList
-	if #list==0 then buildSkillList() end
-	if #list==0 then state.status="No skills found" return end
-
-	local cooldowns=getCooldowns()
-	local now=os.clock()
-	local best,soonest
-	for _,entry in ipairs(list) do
-		local cd=cooldowns[entry.skill]
-		if not cd then
-			if entry.type=="magic" then sendMagic(entry.skill) else sendWeapon(entry.skill) end
-			return
-		end
-		local readyAt=now+cd
-		if not soonest or readyAt<soonest then soonest=readyAt best=entry end
-	end
-	if best then
-		state.status=string.format("Next: %s (%.1fs)",best.skill,soonest-now)
-	else
-		state.status="All skills on cooldown"
-	end
-end
-
-function state.setEnabled(on)
-	on=on==true
-	if on==state.enabled then return on end
-	if not on then
-		state.enabled=false
-		if worker then worker:Disconnect() worker=nil end
-		for _,conn in ipairs(connections) do conn:Disconnect() end
-		table.clear(connections)
-		state.status="Skill Rotation off"
-		return false
-	end
-	local ok,packets=pcall(function() return require(storage.Modules.Packets) end)
-	if not ok or not packets then state.status="Packets unavailable" return false end
-	magicPacket=packets.Magic and packets.Magic.packets and packets.Magic.packets.Cast
-	weaponPacket=packets.Tools and packets.Tools.packets and packets.Tools.packets.BasicTechnique
-	if not magicPacket and not weaponPacket then state.status="No skill packets" return false end
-	buildSkillList()
-	state.enabled=true
-	state.status="Skill Rotation active"
-	worker=game:GetService("RunService").Heartbeat:Connect(function()
-		local ok,err=pcall(step)
-		if not ok then state.setEnabled(false) state.status="Error: "..tostring(err) log(state.status) end
-	end)
-	return true
-end
-
-function state.stop()
-	state.setEnabled(false)
-	state.alive=false
-	if G.VeyraSkillRotation==state then G.VeyraSkillRotation=nil end
-end
-
-connections[1]=player.CharacterAdded:Connect(function()
-	task.wait(1)
-	if state.enabled then buildSkillList() end
-end)
-state.log={}
-return state
-end
-__startSkillRotation() end)
 startModule("auto dodge",function() local function __startAutoDodge()
--- Auto Dodge: fires Combat.RollInput when parry is on cooldown or attack is unparryable.
+-- Auto Dodge: rolls for attacks Auto Parry cannot handle.
+--
+-- Everything here is verified against the recovered client sources:
+--   * the client requests a roll with
+--     `Packets.Combat.packets.RollInput.send({Action="Roll", typeOf=...})`
+--     where typeOf is "" or a *special* dash ("Surge", "AirDash",
+--     "Lightning Dash"); there is no "Backstep" value, so plain rolls send "";
+--   * the server answers on the same packet with Action "success" or
+--     "rejected", so a send is not proof of a roll;
+--   * `StateManager:CanDash()` is the authoritative gate (alive, no
+--     DashCooldown, not Parried/Occupied/Stunned/ParriedAttack/Attacking,
+--     not flying, incapacitated, using a skill, dodging or parrying).
+--
+-- Division of labour with Auto Parry:
+--   * parry owns every attack it has a profile for, and it publishes the
+--     soonest impact (`impactIn`), why it cannot press (`blockedReason`) and how
+--     long its cooldown still runs (`cooldownWait`);
+--   * dodge only rolls when parry provably cannot cover the hit: the cooldown
+--     outlives the impact, or parry has no profile for the animation at all;
+--   * dodge never rolls while a parry session is open, because a roll cancels
+--     the parry it was waiting for.
 local G=getgenv()
 if G.VeyraDodge then G.VeyraDodge.stop() end
-local storage=game:GetService("ReplicatedStorage")
-local player=game:GetService("Players").LocalPlayer
+local Players=game:GetService("Players")
 local RS=game:GetService("RunService")
+local UIS=game:GetService("UserInputService")
+local storage=game:GetService("ReplicatedStorage")
+local player=Players.LocalPlayer
 
-local state={alive=true,enabled=false,status="Auto Dodge off",dodges=0}
+local state={enabled=false,alive=true,status="Dodge off",
+ attempts=0,confirmed=0,rejected=0,log={},animators={}}
 G.VeyraDodge=state
 
-local connections={}
-local worker
-local dodgePacket,parryModule
+local worker,packet,responseConn,manager,character
+local conns={}
+local lastSent=-math.huge
+local backoffUntil=0
+local SEND_GAP=0.55   -- stay clear of DashCooldown; CanDash() is the real gate
+local ROLL_LEAD=0.42  -- roll this long before an impact parry cannot cover
+local REACH=15        -- only react to attackers this close
+local MAX_RISE=8      -- ignore attackers this far above/below
+local SCAN_RATE=0.07
 
-local DODGE_WINDOW=0.35   -- how early before impact to dodge
-local MIN_DODGE_GAP=1.5   -- minimum time between dodges
-
-local lastDodge=-math.huge
+-- Non-attack clips. Anything matching these is never a threat, so an NPC's
+-- reaction or locomotion animation can never trigger a roll.
+local NON_ATTACK={"idle","walk","run","sprint","jump","fall","land","sit","emote",
+ "dance","salute","laugh","meditate","sleep","spawn","death","dead","downed",
+ "stagger","flinch","hit","parry","block","dodge","roll","equip","sheathe",
+ "draw","carry","victim","grabbed","stunned","vault","climb","swim","sing",
+ "spellcast","channel","idle2","turn"}
 
 local function log(msg)
-	table.insert(state.log or {},string.format("%.3f %s",os.clock(),msg))
-	if #(state.log or {})>40 then table.remove(state.log,1) end
+ if #state.log>=120 then table.remove(state.log,1) end
+ table.insert(state.log,string.format("%.3f %s",os.clock(),msg))
 end
 
-local function getParryState()
-	local parry=G.VeyraParry
-	if not parry or not parry.enabled then return nil end
-	return {
-		enabled=true,
-		cooldown=parry.state and parry.state.cooldownWait or 0,
-		blockedReason=parry.state and parry.state.blockedReason,
-		lead=parry.state and parry.state.lead or 0,
-	}
+local function attackLike(track)
+ if track.Looped or track.Length<0.25 then return nil end
+ local anim=track.Animation
+ if not anim then return nil end
+ local lower=string.lower(anim.Name or "")
+ if lower=="" or lower=="animation" then
+  -- Unnamed clips are treated as attacks only when they are short and played
+  -- once; that still excludes looping locomotion.
+  return anim.AnimationId:match("%d+"),anim.Name or "?"
+ end
+ for _,word in ipairs(NON_ATTACK) do
+  if string.find(lower,word,1,true) then return nil end
+ end
+ return anim.AnimationId:match("%d+"),anim.Name
 end
 
-local function findInboundDodgeCandidate()
-	local parry=G.VeyraParry
-	if not parry or not parry.pending then return end
-	local c=player.Character
-	local myRoot=c and c:FindFirstChild("HumanoidRootPart")
-	if not myRoot then return end
-	local now=os.clock()
-	local best,bestRemaining
-	for _,candidate in ipairs(parry.pending) do
-		if not candidate.track.IsPlaying then continue end
-		local pos=candidate.track.TimePosition
-		local remaining=(candidate.hit-pos)/candidate.track.Speed
-		if remaining<=0 or remaining>DODGE_WINDOW then continue end
-		-- Only dodge unparryable attacks or when parry is on cooldown
-		local model=candidate.model
-		local other=model and model:FindFirstChild("HumanoidRootPart")
-		if not other then continue end
-		local dist=(myRoot.Position-other.Position).Magnitude
-		if dist>15 then continue end
-		-- Check if parry would handle this
-		local parryState=getParryState()
-		local canParry=parryState and (parryState.blockedReason~="ParryCooldown") and not parry.isUnparryable and parry.isUnparryable and not parry.isUnparryable(candidate)
-		if not canParry then
-			if not bestRemaining or remaining<bestRemaining then
-				best=candidate
-				bestRemaining=remaining
-			end
-		end
-	end
-	return best,bestRemaining
+-- Soonest impact, in seconds, from an attack Auto Parry has no profile for.
+-- A negative result means the clip already ran past its authored length.
+local function unprofiledImpact(parry)
+ local c=player.Character
+ local root=c and c:FindFirstChild("HumanoidRootPart")
+ if not root then return nil end
+ local best
+ for animator in pairs(state.animators) do
+  local h=animator.Parent
+  local model=h and h.Parent
+  local other=model and model:FindFirstChild("HumanoidRootPart")
+  if h and h:IsA("Humanoid") and h.Health>0 and model~=c and other
+   and not Players:GetPlayerFromCharacter(model)
+   and math.abs(other.Position.Y-root.Position.Y)<=MAX_RISE
+   and (other.Position-root.Position).Magnitude<=REACH then
+   for _,track in ipairs(animator:GetPlayingAnimationTracks()) do
+    local id=attackLike(track)
+    if id and not (parry and parry.enabled and parry.knows and parry.knows(id)) then
+     local speed=track.Speed>0.01 and track.Speed or 1
+     local remaining=(track.Length-track.TimePosition)/speed
+     if remaining>=-0.1 and (not best or remaining<best) then best=remaining end
+    end
+   end
+  end
+ end
+ return best
 end
 
-local function sendDodge()
-	if not dodgePacket then return false end
-	local ok,err=pcall(function() dodgePacket.send({Action="Roll",typeOf="Dodge"}) end)
-	if not ok then log("dodge send: "..tostring(err)) return false end
-	return true
+local function canRoll()
+ if not character or not manager then return false end
+ local ok,dash=pcall(function() return manager:CanDash() end)
+ if not ok or not dash then return false end
+ local hum=character:FindFirstChildOfClass("Humanoid")
+ if not hum or hum.Health<=0 then return false end
+ -- Damage is discarded inside a safezone; a roll there only burns the cooldown.
+ if hum:GetAttribute("InSafezone")==true then return false end
+ if UIS:GetFocusedTextBox() then return false end
+ local now=os.clock()
+ if now<backoffUntil or now-lastSent<SEND_GAP then return false end
+ return true
+end
+
+local function sendRoll()
+ state.attempts+=1
+ local ok,err=pcall(function() packet.send({Action="Roll",typeOf=""}) end)
+ if not ok then
+  log("roll send failed: "..tostring(err))
+  backoffUntil=os.clock()+0.5
+  return false
+ end
+ lastSent=os.clock()
+ return true
+end
+
+local nextScan=0
+local function scan()
+ local keep={}
+ for animator in pairs(state.animators) do
+  local h=animator.Parent
+  local model=h and h.Parent
+  local other=model and model:FindFirstChild("HumanoidRootPart")
+  local c=player.Character
+  local root=c and c:FindFirstChild("HumanoidRootPart")
+  if h and h:IsA("Humanoid") and h.Health>0 and other and root and model~=c
+   and not Players:GetPlayerFromCharacter(model)
+   and (other.Position-root.Position).Magnitude<=REACH+15 then
+   keep[animator]=true
+  end
+ end
+ for animator in pairs(state.animators) do
+  if not keep[animator] then state.animators[animator]=nil end
+ end
+end
+
+local function bindCharacter(c)
+ character=c
+ if c then
+  local ok,result=pcall(function() return require(storage.Modules.StateManager).require(c) end)
+  manager=ok and result or nil
+ else
+  manager=nil
+ end
 end
 
 local function step()
-	if not state.enabled or not state.alive then return end
-	local c=player.Character
-	if not c then return end
-	local humanoid=c:FindFirstChildOfClass("Humanoid")
-	if not humanoid or humanoid.Health<=0 then return end
-	local myRoot=c:FindFirstChild("HumanoidRootPart")
-	if not myRoot then return end
+ local now=os.clock()
+ if player.Character~=character then bindCharacter(player.Character) end
+ if now>=nextScan then nextScan=now+SCAN_RATE scan() end
+ if not character or not manager then return end
 
-	local now=os.clock()
-	if now-lastDodge<MIN_DODGE_GAP then
-		state.status=string.format("Dodge gap: %.1fs",MIN_DODGE_GAP-(now-lastDodge))
-		return
-	end
+ local parry=G.VeyraParry
+ local reason
+ -- A parry session is already in flight: rolling now would cancel it.
+ if parry and parry.enabled and parry.pressing then return end
 
-	local candidate,remaining=findInboundDodgeCandidate()
-	if candidate and remaining>0.05 and remaining<=DODGE_WINDOW then
-		if sendDodge() then
-			lastDodge=now
-			state.dodges+=1
-			log(string.format("dodged %s (%.2fs remaining)",candidate.name,remaining))
-			state.status=string.format("Dodged %s",candidate.name)
-		end
-	else
-		state.status="Auto Dodge active · waiting for unparryable"
-	end
+ if parry and parry.enabled then
+  local impact=parry.impactIn
+  if impact and impact<=ROLL_LEAD and impact>=-0.05 then
+   if parry.blockedReason=="ParryCooldown" then
+    local wait=parry.cooldownWait or math.huge
+    -- The server publishes the real expiry; parry aims its press at it. Only
+    -- roll when that press would still land after the hit.
+    if wait>=impact then reason=string.format("cooldown %.2fs > impact %.2fs",wait,impact) end
+   end
+  end
+ end
+ if not reason then
+  local unprofiled=unprofiledImpact(parry)
+  if unprofiled and unprofiled<=ROLL_LEAD then
+   reason=string.format("unprofiled impact %.2fs",unprofiled)
+  end
+ end
+
+ if not reason then
+  if state.status:find("^Dodge ·") then
+   state.status=string.format("Dodge · %d rolls · %d confirmed · %d rejected",
+    state.attempts,state.confirmed,state.rejected)
+  end
+  return
+ end
+ if not canRoll() then return end
+ if sendRoll() then
+  state.status=string.format("Dodge · %d rolls · %d confirmed · %d rejected",
+   state.attempts,state.confirmed,state.rejected)
+  log("roll: "..reason)
+ end
+end
+
+local function watch(item)
+ if item:IsA("Animator") then state.animators[item]=true end
 end
 
 function state.setEnabled(on)
-	on=on==true
-	if on==state.enabled then return on end
-	if not on then
-		state.enabled=false
-		if worker then worker:Disconnect() worker=nil end
-		for _,conn in ipairs(connections) do conn:Disconnect() end
-		table.clear(connections)
-		state.status="Auto Dodge off"
-		return false
-	end
-	local ok,packets=pcall(function() return require(storage.Modules.Packets) end)
-	if not ok or not packets or not packets.Combat then state.status="Packets unavailable" return false end
-	dodgePacket=packets.Combat.packets and packets.Combat.packets.RollInput
-	if not dodgePacket then state.status="RollInput unavailable" return false end
-	parryModule=G.VeyraParry
-	state.enabled=true
-	state.status="Auto Dodge active"
-	worker=RS.Heartbeat:Connect(function()
-		local ok,err=pcall(step)
-		if not ok then state.setEnabled(false) state.status="Error: "..tostring(err) log(state.status) end
-	end)
-	return true
+ if not state.alive then return false end
+ on=on==true
+ if on==state.enabled then return on end
+ if not on then
+  state.enabled=false
+  if worker then worker:Disconnect() worker=nil end
+  if responseConn then responseConn:Disconnect() responseConn=nil end
+  for _,conn in ipairs(conns) do conn:Disconnect() end
+  table.clear(conns)
+  table.clear(state.animators)
+  state.status="Dodge off"
+  return false
+ end
+ local ok,result=pcall(function() return require(storage.Modules.Packets).Combat.packets.RollInput end)
+ if not ok or not result or type(result.send)~="function" then
+  state.status="Dodge: input unavailable"
+  log(tostring(result))
+  return false
+ end
+ packet=result
+ table.clear(state.animators)
+ state.enabled=true
+ -- Seed from what is already streamed in, then follow new arrivals.
+ for _,item in ipairs(workspace:GetDescendants()) do watch(item) end
+ conns[#conns+1]=workspace.DescendantAdded:Connect(watch)
+ conns[#conns+1]=workspace.DescendantRemoving:Connect(function(item)
+  if state.animators[item] then state.animators[item]=nil end
+ end)
+ if type(result.listen)=="function" then
+  responseConn=result.listen(function(response)
+   if type(response)~="table" then return end
+   if response.Action=="success" then
+    state.confirmed+=1
+   elseif response.Action=="rejected" then
+    state.rejected+=1
+    backoffUntil=os.clock()+0.4
+   end
+  end)
+ end
+ bindCharacter(player.Character)
+ worker=RS.Heartbeat:Connect(function()
+  local success,err=pcall(step)
+  if not success then
+   state.setEnabled(false)
+   state.status="Dodge error: "..tostring(err)
+   log(state.status)
+  end
+ end)
+ return true
 end
 
 function state.stop()
-	state.setEnabled(false)
-	state.alive=false
-	if G.VeyraDodge==state then G.VeyraDodge=nil end
+ if not state.alive then return end
+ state.setEnabled(false)
+ state.alive=false
+ if G.VeyraDodge==state then G.VeyraDodge=nil end
 end
 
-connections[1]=player.CharacterAdded:Connect(function()
-	task.wait(1)
-	-- Auto re-arm handled by setEnabled
-end)
-state.log={}
 return state
+
 end
 __startAutoDodge() end)
-local SR = G.VeyraSkillRotation
-H.skillRotation=SR
 local AD = G.VeyraDodge
 H.autoDodge=AD
 local GA=G.VeyraGather
@@ -4283,9 +4306,6 @@ heading("Defense")
 toggle("Auto Parry","Predicts mob impact from animation poses · equip a melee weapon",false,
  function(on) if AP then AP.setEnabled(on) end end,
  function() return AP and AP.enabled end)
-toggle("Auto Skill Rotation","Cycles Magic.Cast / Tools.BasicTechnique on cooldown",false,
- function(on) if SR then SR.setEnabled(on) end end,
- function() return SR and SR.enabled end)
 toggle("Auto Dodge","Rolls for unparryables · fills parry cooldown gaps",false,
  function(on) if AD then AD.setEnabled(on) end end,
  function() return AD and AD.enabled end)

@@ -6,7 +6,6 @@ if G.VeyraQuestAssist then G.VeyraQuestAssist.stop() end
 if G.VeyraParry then G.VeyraParry.stop() end
 if G.VeyraBossAlerts then G.VeyraBossAlerts.stop() end
 if G.VeyraGather then G.VeyraGather.stop() end
-if G.VeyraSkillRotation then G.VeyraSkillRotation.stop() end
 if G.VeyraDodge then G.VeyraDodge.stop() end
   -- Legacy guard: builds before v2 kept a Kill Aura module here. Reloading the
   -- hub must release its held mouse button, or it keeps swinging on its own.
@@ -89,10 +88,7 @@ startModule("quest assist",function() loadstring(readfile("Veyra/src/quest_assis
 startModule("boss alerts",function() loadstring(readfile("Veyra/src/boss_alerts.lua"),"boss_alerts.lua")() end)
 startModule("auto parry",function() loadstring(readfile("Veyra/src/auto_parry.lua"),"auto_parry.lua")() end)
 startModule("gathering",function() loadstring(readfile("Veyra/src/gather.lua"),"gather.lua")() end)
-startModule("auto skill rotation",function() loadstring(readfile("Veyra/src/auto_skill_rotation.lua"),"auto_skill_rotation.lua")() end)
 startModule("auto dodge",function() loadstring(readfile("Veyra/src/auto_dodge.lua"),"auto_dodge.lua")() end)
-local SR = G.VeyraSkillRotation
-H.skillRotation=SR
 local AD = G.VeyraDodge
 H.autoDodge=AD
 local GA=G.VeyraGather
@@ -446,9 +442,6 @@ heading("Defense")
 toggle("Auto Parry","Predicts mob impact from animation poses · equip a melee weapon",false,
  function(on) if AP then AP.setEnabled(on) end end,
  function() return AP and AP.enabled end)
-toggle("Auto Skill Rotation","Cycles Magic.Cast / Tools.BasicTechnique on cooldown",false,
- function(on) if SR then SR.setEnabled(on) end end,
- function() return SR and SR.enabled end)
 toggle("Auto Dodge","Rolls for unparryables · fills parry cooldown gaps",false,
  function(on) if AD then AD.setEnabled(on) end end,
  function() return AD and AD.enabled end)

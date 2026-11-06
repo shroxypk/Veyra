@@ -181,3 +181,38 @@ The scheduler can request a synthetic M1 release before an inbound attack and
 resume afterward. Its mouse-button arguments and scheduling have been corrected,
 but combat tests have not verified that this interrupts a held attack or improves
 parry success. A calibration grant is not evidence of a successful combat parry.
+
+## Auto Dodge
+
+**Auto Dodge** is a separate toggle in the Combat tab. It exists because parry
+cannot cover everything: it only presses for animations that have a profile, and
+a whiff or a successful parry leaves `ParryCooldown` running for roughly a
+second.
+
+The division of labour is explicit in code. Auto Parry publishes three values
+each frame: the soonest profiled impact (`impactIn`), why it cannot press
+(`blockedReason`), and how long its cooldown still runs (`cooldownWait`). Auto
+Dodge rolls only when parry provably cannot cover the hit:
+
+| Situation | Who acts |
+| --- | --- |
+| Profiled attack, parry ready | Parry presses; dodge stays out |
+| Profiled attack, cooldown ends before impact | Parry aims its press at the real expiry; dodge stays out |
+| Profiled attack, cooldown outlives the impact | Dodge rolls |
+| Animation with no profile (grabs, boss skills, unknown mobs) | Dodge rolls |
+| Parry session already in flight | Nobody; a roll would cancel the pending parry |
+
+Everything it uses was read from the recovered client sources, not guessed. A
+roll is requested with `Packets.Combat.packets.RollInput.send({Action="Roll",
+typeOf=""})`; the client uses `typeOf` only for the special dashes `Surge`,
+`AirDash` and `Lightning Dash`, so a plain defensive roll sends an empty string.
+The server answers on the same packet with `success` or `rejected`, and those
+answers are counted instead of assuming a send worked. The gate is the game's own
+`StateManager:CanDash()` (alive, no `DashCooldown`, not parried/occupied/stunned/
+attacking/flying/incapacitated/using a skill/dodging/parrying), plus a safezone
+and text-focus check.
+
+Reaction clips (hit, parry, dodge, roll, locomotion) are filtered out, so an
+NPC's flinch cannot trigger a roll. Rolls are spaced 0.55 s apart and back off
+for 0.4 s after a rejection. Auto Dodge does not enable, disable, or replace Auto
+Parry, and neither module touches the other's input.

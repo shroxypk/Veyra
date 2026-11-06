@@ -560,8 +560,11 @@ local function getReach(candidate)
 	return DEFAULT_REACH
 end
 
--- Unparryable moves: animation IDs that should never be parried (grabs, guardbreaks, etc.)
--- Verified from client animation folders and wiki. Do not guess.
+-- Clips that must never be treated as an attack. The reaction entries are
+-- structural (they are the game's own parry/dodge/hit clips, never a mob swing);
+-- the rest are reported grabs/guardbreaks and are advisory, not field-verified.
+-- This list only ever *suppresses* a press, so an unverified entry can cost a
+-- parry but can never invent one.
 local UNPARRYABLE = {
 	["14417052527"] = true,  -- Parry reaction
 	["13355016261"] = true,  -- Dodge
@@ -571,12 +574,10 @@ local UNPARRYABLE = {
 	["8495708006"] = true,   -- Hit reaction
 	["132555387434309"] = true,
 	["93087728991591"] = true,
-	-- Mushknight grab (unparryable per wiki - guardbreak)
+	-- Reported grabs/guardbreaks (advisory, unverified in the field)
 	["11469887779"] = true,  -- GrabLunge
-	-- Lizard Boss (guardbreak moves)
 	["137057617868950"] = true,  -- BlightSwipes
 	["138780595177276"] = true,  -- BlightClawAnim
-	-- Alke boss (unparryable skills)
 	["9922542154"] = true,       -- AlkeRoar/AlkeSkill
 }
 
@@ -598,39 +599,6 @@ local function hasLOS(root, other)
 	return result == nil or (result.Instance and result.Instance:IsDescendantOf(other.Parent))
 end
 
--- Priority score: lower = higher priority
--- Factors: distance, HP%, quest target, is using skill, has unparryable moves
-local function priorityScore(candidate, root, now)
-	local model = candidate.model
-	local h = model:FindFirstChildOfClass("Humanoid")
-	local other = model:FindFirstChild("HumanoidRootPart")
-	if not h or not other then return math.huge end
-
-	local delta = root.Position - other.Position
-	local dist = delta.Magnitude
-	local hpPct = h.MaxHealth > 0 and (h.Health / h.MaxHealth) or 1
-
-	local score = dist * 1.0           -- closer first
-	score += (1 - hpPct) * 30          -- lower HP first
-	score += hpPct * 5                 -- slightly prefer damaged
-
-	-- Quest target bonus
-	if QA and QA.selected and model.Name:find(QA.selected) then score -= 50 end
-
-	-- Skill-user gets priority (anti-gank: only one uses skills)
-	local usingSkill = h:GetAttribute("State_UsingSkill") == true
-		or h:GetAttribute("State_SkillActive") == true
-	if usingSkill then score -= 100 end
-
-	-- Unparryable penalty
-	if isUnparryable(candidate) then score += 200 end
-
-	-- LOS penalty
-	if not hasLOS(root, other) then score += 150 end
-
-	return score
-end
-
 local function incoming(candidate,root,remaining)
  local model=candidate.model
  local h=model:FindFirstChildOfClass("Humanoid")
@@ -646,8 +614,10 @@ local function incoming(candidate,root,remaining)
  if math.abs(delta.Y)>10 then return false,"height" end
  local direction=delta.Unit
  local closing=(other.AssemblyLinearVelocity-root.AssemblyLinearVelocity):Dot(direction)
- -- Use configured parry range (state.range) for the UI slider; fall back to mob reach if not set
- local effectiveRange = state.range or reach
+ -- The slider caps how far away a reaction is allowed, but it must never
+ -- stretch a swing beyond the mob's real reach: pressing at 14 studs for an
+ -- 8-stud dagger whiffs the parry and burns the ~1s lockout.
+ local effectiveRange = math.min(state.range or reach, reach+2)
  if not timing.inRange(distance,closing,remaining,effectiveRange) then return false,string.format("range %.1f/%.1f",distance,effectiveRange) end
  if not isCloseSpin and other.CFrame.LookVector:Dot(direction)<0.25 then return false,"attacker facing away" end
  if not hasLOS(root, other) then return false,"no LOS" end
@@ -682,7 +652,7 @@ local function step()
  local root,reason=ready()
  local available=root~=nil
  local myRoot=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
- local nearestInbound,nearestInboundName
+ local nearestInbound,nearestInboundName,nearestInboundId
  local notBefore=-math.huge
  if root then
   state.status=string.format("Parry · %d inputs · %d parried · %d hit",state.attempts,state.confirmed,state.damageEvents)
@@ -709,7 +679,12 @@ local function step()
   if state.blockedReason~=reason then log("waiting: "..reason) end
   state.blockedReason=reason
  end
- if session then return end
+ if session then
+  -- Published for Auto Dodge: a session is in flight, so a roll would cancel it.
+  state.pressing=true state.impactIn=nil state.impactId=nil
+  return
+ end
+ state.pressing=false
  -- No idle calibration: a whiff can impose recovery lag. Only press on profiles.
  -- No defensive hold: unknown attacks may be unparryable or guardbreaking.
   -- Calibration is optional: a pending attack must never be blocked by it.
@@ -730,6 +705,7 @@ local function step()
      if ok2 and inb and (not nearestInbound or remaining<nearestInbound) then
       nearestInbound=remaining
       nearestInboundName=candidate.name
+      nearestInboundId=candidate.id
      end
     end
    -- Learned per-asset shift: runtime misses override the baked measurement.
@@ -756,6 +732,10 @@ local function step()
    end
   end
  end
+ -- Published for Auto Dodge: the soonest profiled impact this module knows
+ -- about, and whether its own gates let it press right now.
+ state.impactIn=nearestInbound
+ state.impactId=nearestInboundId
   -- Release a held attack early: the server keeps Attacking until the current
   -- swing finishes, and CanParry is false while Attacking, so M1 must drop
   -- ahead of the press deadline (which is only lead+window before impact).
@@ -859,5 +839,8 @@ function state.stop()
  state.alive=false
  if G.VeyraParry==state then G.VeyraParry=nil end
 end
+-- Auto Dodge asks this before rolling: an animation this module has a profile
+-- for is left to parry, everything else is dodge's problem.
+function state.knows(id) return id~=nil and (profiles_[id]~=nil or derived[id]~=nil) end
 function state.isWorking() return worker~=nil end
 return state
