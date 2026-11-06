@@ -209,7 +209,7 @@ function state.setEnabled(on)
  if not on then
   state.enabled=false
   if worker then worker:Disconnect() worker=nil end
-  if responseConn then responseConn:Disconnect() responseConn=nil end
+  if responseConn then responseConn() responseConn=nil end
   for _,conn in ipairs(conns) do conn:Disconnect() end
   table.clear(conns)
   table.clear(state.animators)
