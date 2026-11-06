@@ -34,7 +34,7 @@ class FeatureInteractionTests(unittest.TestCase):
         gather = read("src/gather.lua")
         self.assertNotIn("Enum.KeyCode.Space", gather)
         self.assertNotIn("mg.setEnabled", gather)
-        self.assertIn("if mg.active or mg.mine or mg.harvest then", gather)
+        self.assertIn("sessionLive(mg)", gather)
         # Space taps happen only while a round is live and never while typing.
         mg = read("src/minigames.lua")
         self.assertIn("if not state.enabled or state.paused or UIS:GetFocusedTextBox() or not state.active then", mg)

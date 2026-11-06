@@ -148,7 +148,8 @@ G.VeyraMinigames.active=true
 state.setEnabled(true)
 clock+=31
 assert(coroutine.resume(latest))
-assert(not state.enabled and state.phase=="session-timeout" and G.VeyraMinigames.active)
+assert(state.enabled and state.phase=="session-stalled" and G.VeyraMinigames.active,
+ "a stalled session must be abandoned without switching gathering off")
 state.stop()
 assert(G.VeyraGather==nil and not state.alive)
 for _,s in ipairs(signals) do

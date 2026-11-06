@@ -3204,9 +3204,10 @@ local function sessionStatus(mg)
   lastSessionProgress=now lastSessionLog=entry
  end
  if mg.paused then lastSessionProgress=now end
- if now-lastSessionProgress>30 and not mg.paused then
-  state.enabled=false
-  report("session-timeout","Gather paused: minigame has no progress for 30s")
+ if now-lastSessionProgress>12 and not mg.paused then
+  -- A session whose UI never opens leaves mg.harvest set forever. Abandon it
+  -- instead of switching gathering off, so the next node can be tried.
+  report("session-stalled","Session stalled · moving on")
   return false
  end
  local name=mg.mine and "Mining" or mg.harvest and "Harvesting" or "Minigame"
@@ -3214,6 +3215,19 @@ local function sessionStatus(mg)
  state.status=string.format("%s %s · %ds%s",name,state.target or "",now-sessionSince,
   mg.paused and " · paused" or mg.lastResult and (" · "..mg.lastResult) or "")
  return true
+end
+-- mg.mine / mg.harvest survive a session that never opened. Only trust them for
+-- a short grace period after mg.active drops, otherwise gathering stalls for
+-- the rest of the run.
+local staleSince
+local function sessionLive(mg)
+ if mg.active then staleSince=nil return true end
+ if mg.mine or mg.harvest then
+  staleSince=staleSince or os.clock()
+  return os.clock()-staleSince<3
+ end
+ staleSince=nil
+ return false
 end
 local function character()
  local c=player.Character
@@ -3258,7 +3272,7 @@ local function ready(id)
   state.status="Paused: combat / low health" return false
  end
  if not mg or not mg.enabled or mg.paused then state.status="Enable Auto Minigames to gather" return false end
- if mg.active or mg.mine or mg.harvest then sessionStatus(mg) return false end
+ if sessionLive(mg) then sessionStatus(mg) return false end
  sessionSince,lastSessionLog,lastSessionProgress=nil,nil,nil
  return true
 end
@@ -3661,9 +3675,9 @@ local function interact(p,id)
  deadline=os.clock()+4
  while active(id) and os.clock()<deadline do
   local mg=G.VeyraMinigames
-  if mg and (mg.active or mg.mine or mg.harvest) then
+  if mg and sessionLive(mg) then
     state.stats.sessions+=1
-    while active(id) and (mg.active or mg.mine or mg.harvest) do
+    while active(id) and sessionLive(mg) do
      if not sessionStatus(mg) then return end
      if not mg.enabled then report("paused","Enable Auto Minigames to finish this session") return end
      task.wait(0.2)
