@@ -95,6 +95,18 @@ local function watchHumanoid(hum)
     if ar and profile then
      local dist=(victimRoot.Position-ar.Position).Magnitude
      if dist<30 then
+      local delta=victimRoot.Position-ar.Position
+      local facing=delta.Magnitude>0.1 and delta.Unit:Dot(ar.CFrame.LookVector) or 0
+      local hasLOS=true
+      local dir=(ar.Position-victimRoot.Position)
+      local params=RaycastParams.new()
+      params.FilterDescendantsInstances={victim,victim.Parent}
+      params.FilterType=Enum.RaycastFilterType.Exclude
+      local result=workspace:Raycast(victimRoot.Position,dir,params)
+      if result and result.Instance and not result.Instance:IsDescendantOf(entry.model) then
+        hasLOS=false
+      end
+      local hyperArmor=entry.model:GetAttribute("State_HyperArmor")==true
       local elapsed=now-entry.start
       for _,hit in ipairs(profile.hits) do
        local marker=hit/entry.speed
@@ -102,7 +114,10 @@ local function watchHumanoid(hum)
        if not bestFit or fit<bestFit then
         best={asset=entry.id,name=profile.name,elapsed=elapsed,marker=marker,
          residual=elapsed-marker,dist=dist,attacker=entry.model.Name,
-         damage=damage,self=isSelf,states=ownStates()}
+         damage=damage,self=isSelf,states=ownStates(),
+         facing=facing,los=hasLOS,hyperArmor=hyperArmor,
+         burning=player.Character and player.Character:GetAttribute("State_Burning")==true,
+         rtt=0}
         bestFit=fit
        end
       end
@@ -112,6 +127,9 @@ local function watchHumanoid(hum)
   end
   if best and #records<5000 then
    best.t=now
+   -- C13: Rolling RTT sample
+   local ok,server=pcall(function() return workspace:GetServerTimeNow() end)
+   if ok then best.rtt=server-os.clock() end
    records[#records+1]=best
    bump("records")
   end
@@ -141,6 +159,10 @@ local function watchAttributes(c)
    if ok and type(server)=="number" then
     noteDuration("LEAD_"..name,value-server)
    end
+  end
+  -- C13: Own-grant StateDuration_Parrying capture
+  if name=="StateDuration_Parrying" and type(value)=="number" then
+   noteDuration("GRANT_Parrying",value)
   end
  end)
 end
@@ -214,13 +236,37 @@ local function collectMarkers()
 end
 
 -- ===== wiring =====
+local projectiles={}
 for _,item in ipairs(workspace:GetDescendants()) do
  if item:IsA("Animator") then animators[item]=true watchAnimator(item)
  elseif item:IsA("Humanoid") then watchHumanoid(item) end
 end
 workspace.DescendantAdded:Connect(function(item)
  if item:IsA("Animator") then watchAnimator(item)
- elseif item:IsA("Humanoid") then watchHumanoid(item) end
+ elseif item:IsA("Humanoid") then watchHumanoid(item)
+ elseif item:IsA("BasePart") then
+  -- C13: Projectile record class
+  local vel=item.AssemblyLinearVelocity
+  local speed=vel.Magnitude
+  if speed>1 then
+   local char=player.Character
+   local root=char and char:FindFirstChild("HumanoidRootPart")
+   if root then
+    local dir=(root.Position-item.Position)
+    local dist=dir.Magnitude
+    if dist>0.1 and dist<100 then
+     local dot=dir.Unit:Dot(vel.Unit)
+     if dot>0.5 then
+      local eta=dist/speed
+      if eta<1.5 and #projectiles<100 then
+       projectiles[#projectiles+1]={name=item.Name,eta=eta,dist=dist,speed=speed,t=os.clock()}
+       bump("projectiles")
+      end
+     end
+    end
+   end
+  end
+ end
 end)
 if player.Character then watchAttributes(player.Character) end
 player.CharacterAdded:Connect(function(c) task.wait(0.4) if not stopping then watchAttributes(c) end end)
@@ -261,9 +307,10 @@ task.spawn(function()
  save("impacts.json",{records=records})
  save("markers2.json",{profiles=markers})
  save("durations.json",durations)
+ save("projectiles.json",{projectiles=projectiles})
  save("meta2.json",meta)
- print(("[col] done %.0fs | records %d | markers %d | durations %d")
-  :format(meta.elapsed,#records,#markers,meta.counts.durations or 0))
+ print(("[col] done %.0fs | records %d | markers %d | durations %d | projectiles %d")
+  :format(meta.elapsed,#records,#markers,meta.counts.durations or 0,#projectiles))
 end)
 
 G.__col={stop=function() stopRequested=true print("[col] stopping") end}
