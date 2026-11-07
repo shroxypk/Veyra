@@ -3173,7 +3173,7 @@ local function step()
     best,bestLatest=entry.candidate,entry.latest
     best.remaining=entry.remaining
    end
-   coveredUntil=impactAt+PARRY_WINDOW
+   coveredUntil=impactAt+PARRY_WINDOW/2
    chainEnd=impactAt+GRACE_LOCK+0.03
   else
    state.orphans[#state.orphans+1]={remaining=entry.remaining,
@@ -3347,7 +3347,7 @@ local worker,packet,responseConn,manager,character
 local conns={}
 local lastSent=-math.huge
 local backoffUntil=0
-local SEND_GAP=0.5    -- stay clear of DashCooldown; CanDash() is the real gate
+local SEND_GAP=0.62   -- a false positive must not eat the next real hit; CanDash() is the real gate
 local ROLL_LEAD=0.34  -- roll this long before an impact parry cannot cover
 local REACH=15        -- only react to attackers this close
 local MAX_RISE=8      -- ignore attackers this far above/below
@@ -3400,9 +3400,18 @@ local function unprofiledImpact(parry)
    for _,track in ipairs(animator:GetPlayingAnimationTracks()) do
     local id=attackLike(track)
     if id and not (parry and parry.enabled and parry.knows and parry.knows(id)) then
-     local speed=track.Speed>0.01 and track.Speed or 1
-     local remaining=(track.Length-track.TimePosition)/speed
-     if remaining>=-0.1 and (not best or remaining<best) then best=remaining end
+     -- Mirror parry's validity gate: an unknown clip only counts when the mob
+     -- is close enough or actually turned toward us. Without this, idle-adjacent
+     -- clips on unknown mobs burn the roll and DashCooldown eats the real hit.
+     -- delta points mob -> player, matching parry's incoming() convention.
+     local delta=root.Position-other.Position
+     local distance=delta.Magnitude
+     local facing=distance>0.001 and delta.Unit:Dot(other.CFrame.LookVector) or 1
+     if distance<=10 or facing>0.25 then
+      local speed=track.Speed>0.01 and track.Speed or 1
+      local remaining=(track.Length-track.TimePosition)/speed
+      if remaining>=-0.1 and (not best or remaining<best) then best=remaining end
+     end
     end
    end
   end
@@ -3486,7 +3495,7 @@ local function step()
   local orphan=parry.orphans and parry.orphans[1]
   if lockFree and orphan and orphan.remaining<=ROLL_LEAD and orphan.remaining>=-0.05 then
    reason=string.format("orphan %s %.2fs",orphan.name or "?",orphan.remaining)
-  elseif impact and impact<=ROLL_LEAD and impact>=-0.05 then
+  elseif lockFree and impact and impact<=ROLL_LEAD and impact>=-0.05 then
    local wait=parry.cooldownWait or 0
    if parry.lockKind and wait>impact then
     reason=string.format("%s lock %.2fs > impact %.2fs",parry.lockKind,wait,impact)

@@ -860,7 +860,7 @@ local function step()
     best,bestLatest=entry.candidate,entry.latest
     best.remaining=entry.remaining
    end
-   coveredUntil=impactAt+PARRY_WINDOW
+   coveredUntil=impactAt+PARRY_WINDOW/2
    chainEnd=impactAt+GRACE_LOCK+0.03
   else
    state.orphans[#state.orphans+1]={remaining=entry.remaining,
