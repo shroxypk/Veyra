@@ -3024,6 +3024,25 @@ local function learnProfileShape(id)
   saveLearned()
 end
 
+-- AoE classification (C7)
+local AOE_NAME_PATTERN="screech|roar|bomb|summon|explosion|field|rupture"
+local function isAOE(candidate)
+  local id=candidate.id
+  local name=(candidate.name or ""):lower()
+  -- Name-based classification
+  if name:find(AOE_NAME_PATTERN) then return true end
+  -- Learned from C1 store
+  if id and learned.assets[id] and learned.assets[id].aoe then return true end
+  -- HyperArmor state check
+  local model=candidate.model
+  if model and model:GetAttribute("State_HyperArmor")==true then return true end
+  -- Narrow spike check (from profile data - burst width)
+  -- If the profile has a single hit and the asset is known for AoE patterns,
+  -- we classify it. Spike width is derived from keyframe data but we don't
+  -- have it at runtime, so we use name + state signals.
+  return false
+end
+
 local function observe(model,track)
  if seen[track] then return end
  seen[track]=true
@@ -3229,6 +3248,7 @@ local function incoming(candidate,root,remaining)
  if not h or h.Health<=0 or not other then return false,"attacker unavailable" end
  if interrupted(model) then return false,"attacker interrupted" end
  if isUnparryable(candidate) then return false,"unparryable move" end
+ if isAOE(candidate) then return false,"aoe move" end
  -- C6: Lag compensation - extrapolate attacker position by velocity * RTT/2.
  -- The attacker's root on this client is slightly behind where it is on the server.
  -- Clamp total extrapolation travel to 0.12s.
@@ -3334,6 +3354,7 @@ local function step()
  -- ============================================================
  local best,bestLatest=nil,-math.huge
  local chainCands={}
+ local aoeOrphans={}
  for i=#pending,1,-1 do
   local candidate=pending[i]
   local track=candidate.track
@@ -3343,6 +3364,12 @@ local function step()
    table.remove(pending,i)
   else
    local remaining=(candidate.hit-position)/track.Speed
+   -- C7: AoE assets publish to orphans with kind="roll", never a parry press
+   if isAOE(candidate) and remaining<=1.5 then
+    local rollLead=getAsset(candidate.id,"rollLead",0.34)
+    aoeOrphans[#aoeOrphans+1]={kind="roll",remaining=remaining,rollLead=rollLead,
+     name=candidate.name,id=candidate.id}
+   end
    if myRoot and remaining<=ATTACK_RELEASE_HORIZON then
     local ok2,inb=pcall(incoming,candidate,myRoot,remaining)
     if ok2 and inb and (not nearestInbound or remaining<nearestInbound) then
@@ -3435,6 +3462,11 @@ local function step()
    end
    state.orphans[#state.orphans+1]={kind=kind,remaining=entry.remaining,
     name=entry.candidate.name,id=entry.candidate.id}
+  end
+  -- C7: AoE orphans come first (they're rolls, not parries)
+  table.sort(aoeOrphans,function(a,b) return a.remaining<b.remaining end)
+  for _,entry in ipairs(aoeOrphans) do
+   table.insert(state.orphans,1,entry)
   end
 
  state.impactIn=nearestInbound
