@@ -2956,6 +2956,29 @@ local function lockEndsAt(c,now)
  return nil
 end
 
+-- Learn profile shape (clusterThreshold, derivedHitOffset) from static profile data.
+-- Called once per asset when first observed.
+local function learnProfileShape(id)
+  if not id or learned.assets[id] and learned.assets[id].shapeLearned then return end
+  local profile=profiles_[id] or derived[id]
+  if not profile or not profile.hits or #profile.hits<2 then return end
+  -- clusterThreshold: minimum gap between adjacent hits
+  local minGap=math.huge
+  for j=2,#profile.hits do
+   minGap=math.min(minGap,profile.hits[j]-profile.hits[j-1])
+  end
+  if minGap>0 and minGap<2 then
+   local ct=math.clamp(minGap*0.9,0.2,0.6)
+   if not learned.assets[id] or math.abs((learned.assets[id].clusterThreshold or 0.28)-ct)>0.005 then
+    setAsset(id,"clusterThreshold",ct)
+   end
+  end
+  -- derivedHitOffset: not learnable from static data, keep default (0.03) until residuals teach it
+  learned.assets[id]=learned.assets[id] or {}
+  learned.assets[id].shapeLearned=true
+  saveLearned()
+end
+
 local function observe(model,track)
  if seen[track] then return end
  seen[track]=true
@@ -2972,6 +2995,7 @@ local function observe(model,track)
  end
  if not profile then return end
  if track.Looped then return end
+ if id then learnProfileShape(id) end
  for _,hit in ipairs(profile.hits) do
   table.insert(pending,{model=model,track=track,hit=hit,name=profile.name,id=id,
    gate=profile.gate,length=profile.length,offset=profile.offset,
@@ -3234,25 +3258,6 @@ local function step()
      nearestInbound=remaining
      nearestInboundName=candidate.name
      nearestInboundId=candidate.id
-    end
-   end
-   -- Learn this asset's merge threshold from the smallest gap between two
-   -- distinct impacts in its profile. Pending entries carry a single `.hit`,
-   -- so the profile is the only place the spacing exists.
-   if candidate.id then
-    local profile = profiles_[candidate.id] or derived[candidate.id]
-    if profile and profile.hits and #profile.hits > 1 then
-     local minGap = math.huge
-     for j=2,#profile.hits do
-      minGap = math.min(minGap, profile.hits[j] - profile.hits[j-1])
-     end
-     if minGap > 0 and minGap < 2 then
-      local learned = math.clamp(minGap * 0.9, 0.2, 0.6)
-      local current = getAsset(candidate.id,"clusterThreshold",0.28)
-      if math.abs(current - learned) > 0.005 then
-       setAsset(candidate.id,"clusterThreshold",learned)
-      end
-     end
     end
    end
    local effective=state.lead+state.leadOffset+(getAsset(candidate.id,"parryOffset",0) or candidate.offset or 0)
