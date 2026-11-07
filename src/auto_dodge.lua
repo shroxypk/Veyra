@@ -37,8 +37,8 @@ local worker,packet,responseConn,manager,character
 local conns={}
 local lastSent=-math.huge
 local backoffUntil=0
-local SEND_GAP=0.62   -- a false positive must not eat the next real hit; CanDash() is the real gate
-local ROLL_LEAD=0.34  -- roll this long before an impact parry cannot cover
+local SEND_GAP=1.55   -- DashCooldown is 1.5s; a false positive must not eat the next real hit
+local ROLL_LEAD=0.19  -- fallback; prefers parry.rollLead = rollDur/2 + outbound
 local REACH=15        -- only react to attackers this close
 local MAX_RISE=8      -- ignore attackers this far above/below
 local SCAN_RATE=0.25  -- 4Hz is plenty; 0.07s burns CPU for no gain
@@ -184,16 +184,18 @@ local function step()
   local lockKind=parry.lockKind
   local lockFree=lockKind=="whiff" or not lockKind
    or (lockKind=="grace" and (parry.cooldownWait or 0)>(impact or math.huge))
-  -- F3: Only roll-kind orphans. A parry-kind orphan means parry is pressing it.
+  -- C15: Use parry.rollLead as single source of truth.
+  local lead=(parry and parry.rollLead) or ROLL_LEAD
+  -- F3/C16: Only roll-kind orphans. "drop" is not a roll.
   local orphan
   if parry.orphans then
    for _,o in ipairs(parry.orphans) do
-    if o.kind ~= "parry" then orphan=o break end
+    if o.kind == "roll" then orphan=o break end
    end
   end
-  if lockFree and orphan and orphan.remaining<=ROLL_LEAD and orphan.remaining>=-0.05 then
+  if lockFree and orphan and orphan.remaining<=lead and orphan.remaining>=-0.05 then
    reason=string.format("orphan %s %.2fs",orphan.name or "?",orphan.remaining)
-  elseif lockFree and impact and impact<=ROLL_LEAD and impact>=-0.05 then
+  elseif lockFree and impact and impact<=lead and impact>=-0.05 then
    local wait=parry.cooldownWait or 0
    if wait>impact then
     reason=string.format("cooldown %.2fs > impact %.2fs",wait,impact)

@@ -84,8 +84,8 @@ class F3DodgeOrphanTests(unittest.TestCase):
     def test_dodge_filters_by_kind(self):
         """auto_dodge.lua must filter orphans by kind."""
         code=(ROOT/"src/auto_dodge.lua").read_text(encoding="utf-8")
-        self.assertIn('o.kind ~= "parry"', code,
-            "dodge must filter out parry-kind orphans")
+        self.assertIn('o.kind == "roll"', code,
+            "dodge must only take roll-kind orphans")
         self.assertIn("for _,o in ipairs(parry.orphans)", code)
 
     def test_dodge_header_documents_kind(self):
@@ -99,21 +99,21 @@ class F4CoverageTests(unittest.TestCase):
     """F4: correct C4 coverage metric."""
 
     def test_roll_duration_config(self):
-        """ROLL_DURATION must be config-driven with default 0.45."""
+        """ROLL_DURATION must be config-driven with default 0.275."""
         code=(ROOT/"src/auto_parry.lua").read_text(encoding="utf-8")
-        self.assertIn('cfg("rollDuration",0.45)', code)
+        self.assertIn('ROLL_DURATION=cfg("rollDuration",0.275)', code)
 
     def test_roll_duration_learned(self):
-        """rollDuration must be learned from StateDuration_Rolling."""
+        """rollDuration must be learned from StateDuration_Dodging first."""
         code=(ROOT/"src/auto_parry.lua").read_text(encoding="utf-8")
+        self.assertIn('StateDuration_Dodging', code)
         self.assertIn('StateDuration_Rolling', code)
-        self.assertIn('state.rollDuration', code)
 
     def test_coveredFor_function(self):
-        """coveredFor must implement the correct metric."""
+        """simulate must implement the correct metric."""
         code=(ROOT/"src/auto_parry.lua").read_text(encoding="utf-8")
-        self.assertIn("local function coveredFor(mode)", code)
-        self.assertIn("rollDur+0.03", code)
+        self.assertIn("local function simulate(mode)", code)
+        self.assertIn("freeAt=impactAt+ROLL_DURATION", code)
 
     def test_canDash_gate(self):
         """Roll-first must check CanDash availability."""

@@ -1760,6 +1760,13 @@ return {
  ["9920882854"]={name="Left Swipe",length=1.233333,hits={0.430000}},
  ["9920890274"]={name="Strike",length=1.000000,hits={0.530000}},
  ["9924282016"]={name="AlkeCombo",length=1.960000,hits={0.270000,1.070000,1.710000}},
+ ["97749185835376"]={name="Rampage",length=1.000000,hits={0.500000},aoe=true},
+ ["129235717372722"]={name="Hunting_3",length=1.000000,hits={0.500000},aoe=true},
+ ["71734496574082"]={name="MushknightGrab",length=1.000000,hits={0.500000},aoe=true},
+ ["81129151966619"]={name="Combat",length=1.000000,hits={0.500000},aoe=true},
+ ["76118361445272"]={name="Howling Slash",length=1.000000,hits={0.500000},aoe=true},
+ ["136194022789035"]={name="Feral Impact",length=1.000000,hits={0.500000},parryOffset=-0.10},
+ ["10250846568"]={name="Misdirect",length=0.283330,hits={0.216660},parryOffset=0.30},
 }
 
 end)()
@@ -2277,6 +2284,13 @@ return {
  ["9920882854"]={name="Left Swipe",length=1.233333,hits={0.430000}},
  ["9920890274"]={name="Strike",length=1.000000,hits={0.530000}},
  ["9924282016"]={name="AlkeCombo",length=1.960000,hits={0.270000,1.070000,1.710000}},
+ ["97749185835376"]={name="Rampage",length=1.000000,hits={0.500000},aoe=true},
+ ["129235717372722"]={name="Hunting_3",length=1.000000,hits={0.500000},aoe=true},
+ ["71734496574082"]={name="MushknightGrab",length=1.000000,hits={0.500000},aoe=true},
+ ["81129151966619"]={name="Combat",length=1.000000,hits={0.500000},aoe=true},
+ ["76118361445272"]={name="Howling Slash",length=1.000000,hits={0.500000},aoe=true},
+ ["136194022789035"]={name="Feral Impact",length=1.000000,hits={0.500000},parryOffset=-0.10},
+ ["10250846568"]={name="Misdirect",length=0.283330,hits={0.216660},parryOffset=0.30},
 }
 
 end)()
@@ -2351,7 +2365,10 @@ local prefs=G.VeyraConfig and G.VeyraConfig.values and G.VeyraConfig.values.parr
 local function cfg(key,def) return prefs[key] or def end
 
 local PARRY_WINDOW=cfg("parryWindow",0.3)
-local ROLL_DURATION=cfg("rollDuration",0.45)
+local ROLL_DURATION=cfg("rollDuration",0.275)
+local OUTBOUND=cfg("outbound",0.056)
+local ALLOW_CANCEL=cfg("allowCancel",0.206)
+local DASH_COOLDOWN=cfg("dashCooldown",1.5)
 local SESSION_MIN=cfg("sessionMin",0.3)
 local GRANT_MARGIN=cfg("grantMargin",0.12)
 local UNPARRY_CONFIRM=cfg("unparryConfirm",2)
@@ -2390,6 +2407,7 @@ local state={enabled=false,alive=true,status="Parry off",profiles=profileCount,
  range=cfg("range",14),leadOffset=0,lead=si.lead,grantLag=si.grantLag,
  parryWindow=si.parryWindow,
  rollDuration=ROLL_DURATION,
+ rollLead=ROLL_DURATION/2+OUTBOUND,
  attempts=0,grants=0,confirmed=0,damageEvents=0,
  unknown=0,missed=0,covered=0,gated=0,learned=0,calibrated=si.calibrated,
  bias=si.bias,hitResiduals={},
@@ -2416,6 +2434,11 @@ end
 local function getAssetRollDuration()
  return state.rollDuration or ROLL_DURATION
 end
+
+-- C15: Roll lead derived from measured roll window.
+-- The impact should land mid-roll and before AllowCancel, so:
+-- rollLead = rollDur/2 + outbound
+local function rollLead() return getAssetRollDuration()/2 + OUTBOUND end
 
 -- ============================================================
 -- PER-ASSET PARAMETER STORE (C1)
@@ -3018,10 +3041,11 @@ local function bindCharacter(c)
      state.parryWindow=state.parryWindow*0.8+duration*0.2
      markSiDirty()
     end
-     -- F4: Learn roll duration from StateDuration_Rolling.
-     local rollDur=c:GetAttribute("StateDuration_Rolling")
+     -- C15: Learn roll length from StateDuration_Dodging first, then Rolling.
+     local rollDur=c:GetAttribute("StateDuration_Dodging") or c:GetAttribute("StateDuration_Rolling")
      if rollDur and rollDur>0.05 and rollDur<1.5 then
       state.rollDuration=state.rollDuration*0.8+rollDur*0.2
+      state.rollLead=rollLead()
       markSiDirty()
      end
     if endAt and duration and session.sendServer then
@@ -3169,7 +3193,7 @@ local function isAOE(candidate)
   -- Name-based classification
   if name:find(AOE_NAME_PATTERN) then return true end
   -- Learned from C1 store
-  if id and learned.assets[id] and learned.assets[id].aoe then return true end
+  if id and getAsset(id,"aoe",false) then return true end
   -- HyperArmor state check
   local model=candidate.model
   if model and model:GetAttribute("State_HyperArmor")==true then return true end
@@ -3541,7 +3565,8 @@ local function step()
      nearestInboundId=candidate.id
     end
    end
-   local effective=state.lead+state.leadOffset+(getAsset(candidate.id,"parryOffset",0) or candidate.offset or 0)
+   local authored=getAsset(candidate.id,"parryOffset",nil)
+   local effective=state.lead+state.leadOffset+((authored~=nil) and authored or candidate.offset or 0)
    local at,latest=timing.window(position,track.Speed,candidate.hit,effective,
     parryWindow()/2,candidate.gate)
    if latest and latest< -0.05 then
@@ -3572,6 +3597,18 @@ local function step()
   -- against roll-then-parry by covered-hit count and choose the better.
   -- Emit assignments as {kind="parry"|"roll", candidate} on state.orphans.
   -- kind="parry" entries still become presses. Break ties toward parry.
+  -- C16: dashReadyAt computed once per frame.
+  local dashReadyAt=now
+  if char then
+   local dcEnd=char:GetAttribute("StateEnd_DashCooldown")
+   if type(dcEnd)=="number" then
+    local ok,server=pcall(function() return workspace:GetServerTimeNow() end)
+    if ok and type(server)=="number" then dashReadyAt=now+math.max(0,dcEnd-server) end
+   elseif manager then
+    local ok,canDash=pcall(function() return manager:CanDash() end)
+    if not ok or not canDash then dashReadyAt=now+0.1 end
+   end
+  end
   table.sort(chainCands,function(a,b) return a.remaining<b.remaining end)
   local n=#chainCands
   local assign={} -- "parry" or "roll" for each candidate
@@ -3589,34 +3626,52 @@ local function step()
    if #group==1 then
      assign[i]="parry"
    else
-    -- F4: Corrected coverage metric.
-    -- coveredFor(mode) = 1 + count of subsequent hits at least
-    -- (mode=="parry" and GRACE_LOCK or ROLL_DURATION+GRACE_LOCK) after first.
-    local rollDur=getAssetRollDuration()
-    local function coveredFor(mode)
-      -- F4: For parry mode, subsequent hits need GRACE_LOCK gap.
-      -- For roll mode, subsequent hits need ROLL_DURATION gap
-      -- (you can parry immediately after rolling ends).
-      local gap=(mode=="parry") and (GRACE_LOCK+0.03) or (rollDur+0.03)
-     local count=1
-     for k=2,#group do
-      local nextImpact=now+group[k].remaining
-      if nextImpact>=impactAt+gap then count=count+1 end
-     end
-     return count
+    -- C16: forward-simulate both strategies with real gates.
+    local GRACE=GRACE_LOCK+0.03
+    local function parryAt(t) return t-state.lead-state.leadOffset end
+    local function rollAt(t) return t-rollLead() end
+    local ROLL_RECOVER=0.09
+    local function simulate(mode)
+      local freeAt=impactAt
+      local dashAt=dashReadyAt
+      local covered=1
+      if mode=="roll" then
+        freeAt=impactAt+ROLL_DURATION
+        dashAt=impactAt+DASH_COOLDOWN
+      else
+        freeAt=impactAt+GRACE_LOCK
+      end
+      for k=2,#group do
+        local t=now+group[k].remaining
+        local p=parryAt(t)
+        if p>=freeAt and p>=impactAt+ROLL_RECOVER then
+          covered=covered+1
+          freeAt=t+GRACE_LOCK
+        else
+          local r=rollAt(t)
+          if r>=freeAt and r>=dashAt then
+            covered=covered+1
+            freeAt=t+ROLL_DURATION
+            dashAt=t+DASH_COOLDOWN
+          end
+        end
+      end
+      return covered
     end
-    -- Check if roll is available via CanDash
+    -- Check if roll is sendable for hit1
     local canRollNow=false
-    if manager then
+    if manager and rollAt(impactAt)>=now then
      local ok,dash=pcall(function() return manager:CanDash() end)
      canRollNow=ok and dash==true
     end
-    if canRollNow and coveredFor("roll")>coveredFor("parry") then
+    if canRollNow and simulate("roll")>simulate("parry") then
+     -- Roll first, then parry rest where possible
      assign[i]="roll"
      for k=2,#group do assign[i+k-1]="parry" end
     else
+     -- Parry first, drop rest
      assign[i]="parry"
-     for k=2,#group do assign[i+k-1]="roll" end
+     for k=2,#group do assign[i+k-1]="drop" end
     end
     end
    i=j
@@ -3845,8 +3900,8 @@ local worker,packet,responseConn,manager,character
 local conns={}
 local lastSent=-math.huge
 local backoffUntil=0
-local SEND_GAP=0.62   -- a false positive must not eat the next real hit; CanDash() is the real gate
-local ROLL_LEAD=0.34  -- roll this long before an impact parry cannot cover
+local SEND_GAP=1.55   -- DashCooldown is 1.5s; a false positive must not eat the next real hit
+local ROLL_LEAD=0.19  -- fallback; prefers parry.rollLead = rollDur/2 + outbound
 local REACH=15        -- only react to attackers this close
 local MAX_RISE=8      -- ignore attackers this far above/below
 local SCAN_RATE=0.25  -- 4Hz is plenty; 0.07s burns CPU for no gain
@@ -3992,16 +4047,18 @@ local function step()
   local lockKind=parry.lockKind
   local lockFree=lockKind=="whiff" or not lockKind
    or (lockKind=="grace" and (parry.cooldownWait or 0)>(impact or math.huge))
-  -- F3: Only roll-kind orphans. A parry-kind orphan means parry is pressing it.
+  -- C15: Use parry.rollLead as single source of truth.
+  local lead=(parry and parry.rollLead) or ROLL_LEAD
+  -- F3/C16: Only roll-kind orphans. "drop" is not a roll.
   local orphan
   if parry.orphans then
    for _,o in ipairs(parry.orphans) do
-    if o.kind ~= "parry" then orphan=o break end
+    if o.kind == "roll" then orphan=o break end
    end
   end
-  if lockFree and orphan and orphan.remaining<=ROLL_LEAD and orphan.remaining>=-0.05 then
+  if lockFree and orphan and orphan.remaining<=lead and orphan.remaining>=-0.05 then
    reason=string.format("orphan %s %.2fs",orphan.name or "?",orphan.remaining)
-  elseif lockFree and impact and impact<=ROLL_LEAD and impact>=-0.05 then
+  elseif lockFree and impact and impact<=lead and impact>=-0.05 then
    local wait=parry.cooldownWait or 0
    if wait>impact then
     reason=string.format("cooldown %.2fs > impact %.2fs",wait,impact)

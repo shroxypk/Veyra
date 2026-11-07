@@ -23,7 +23,8 @@ short pulse, not a hold. Pressing again while a window is open cannot extend it.
 ## Lockout is max, not sum
 
 A successful parry removes `ParryCooldown` and applies `APF` (0.5s) and
-`ParriedAttack` (0.25s) simultaneously. The lockout is the later of the two
+`ParriedAttack` (0.25s) simultaneously. `ROLL_LEAD` is `rollDur/2 + outbound`, so
+the impact lands mid-roll and before `AllowCancel` (0.206s). The lockout is the later of the two
 expiries, not their sum. The scheduler computes:
 
 ```lua
@@ -51,16 +52,12 @@ mistake: it misses 972 of the residuals the current build covers.
 
 ## Coverage-maximising chain assignment
 
-When two attacks arrive within one lockout window (0.75s), the scheduler
-compares two strategies:
-
-1. **Parry first, drop second**: 1 parry + 0 parries
-2. **Roll first, parry second**: 0 parries + 1 parry (if spacing allows)
-
-It chooses whichever covers more hits. Ties break toward parry. Assignments
-are emitted as `{kind="parry"|"roll", candidate}` on `state.orphans`. The
-`kind="parry"` entries still become presses; `kind="roll"` entries are for
-Auto Dodge.
+When attacks arrive within one lockout window, the scheduler forward-simulates
+both strategies with real gates (0.09s roll recovery, grace lock, dash cooldown)
+and picks the higher covered count. Ties break toward parry. Assignments are
+emitted as `{kind="parry"|"roll"|"drop", candidate}` on `state.orphans`.
+The `kind="parry"` entries still become presses; `kind="roll"` entries are for
+Auto Dodge; `kind="drop"` entries are uncovered.
 
 ## AoE route
 
@@ -113,7 +110,7 @@ rejected rather than extending the deadline artificially.
 Each of these exists because the alternative costs the ~1 s lockout:
 
 - no press while `ParryCooldown`, `Attacking`, `Parried`, `Ragdoll`, `Occupied`,
-  `Dodging`, `Blocking` or `UsingSkill` is active;
+  `Blocking` or `UsingSkill` is active;
 - no press during the `APF` grace after a successful parry (hits are negated
   already);
 - no press in `InSafezone` (damage is discarded there);
@@ -283,6 +280,6 @@ attacking/flying/incapacitated/using a skill/dodging/parrying), plus a safezone
 and text-focus check.
 
 Reaction clips (hit, parry, dodge, roll, locomotion) are filtered out, so an
-NPC's flinch cannot trigger a roll. Rolls are spaced 0.55 s apart and back off
+NPC's flinch cannot trigger a roll. Rolls are spaced 1.55 s apart, matching DashCooldown and back off
 for 0.4 s after a rejection. Auto Dodge does not enable, disable, or replace Auto
 Parry, and neither module touches the other's input.

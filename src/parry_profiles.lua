@@ -180,4 +180,11 @@ return {
  ["9920882854"]={name="Left Swipe",length=1.233333,hits={0.430000}},
  ["9920890274"]={name="Strike",length=1.000000,hits={0.530000}},
  ["9924282016"]={name="AlkeCombo",length=1.960000,hits={0.270000,1.070000,1.710000}},
+ ["97749185835376"]={name="Rampage",length=1.000000,hits={0.500000},aoe=true},
+ ["129235717372722"]={name="Hunting_3",length=1.000000,hits={0.500000},aoe=true},
+ ["71734496574082"]={name="MushknightGrab",length=1.000000,hits={0.500000},aoe=true},
+ ["81129151966619"]={name="Combat",length=1.000000,hits={0.500000},aoe=true},
+ ["76118361445272"]={name="Howling Slash",length=1.000000,hits={0.500000},aoe=true},
+ ["136194022789035"]={name="Feral Impact",length=1.000000,hits={0.500000},parryOffset=-0.10},
+ ["10250846568"]={name="Misdirect",length=0.283330,hits={0.216660},parryOffset=0.30},
 }
