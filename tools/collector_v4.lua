@@ -16,13 +16,12 @@ local stopping=false
 local stopRequested=false
 local PROBE_ROLLS=true
 local TARGET_UNIVERSE=3164482049
-local TARGET_PLACE=8248288152
 local MAX_SECONDS=600
 local FETCH_DELAY=0.14
 local DIR="Veyra/recon"
 
 print("[col] v4 starting")
-if not (game.GameId==TARGET_UNIVERSE or game.PlaceId==TARGET_PLACE) then
+if game.GameId~=TARGET_UNIVERSE then
  print(("[col] WARNING universe %d place %d"):format(game.GameId,game.PlaceId))
 else
  print(("[col] universe %d place %d confirmed"):format(game.GameId,game.PlaceId))
