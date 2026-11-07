@@ -724,7 +724,8 @@ end
 -- blocking, dodging, incapacity, skill use and flight; these are the extra
 -- states the server refuses a parry in and CanBlock does not model.
 local HARD_STATES={"Carrying","Ragdolled","Climbing","Burning","CantCombat",
- "CombatDebounce","BlockBroken","Ragdoll","Knocked","Downed","SkillActive"}
+ "CombatDebounce","BlockBroken","Ragdoll","Knocked","Downed","SkillActive",
+ "Swinging","KnockSlide","Slowed"}
 local function hardBlocked(c)
  for _,name in ipairs(HARD_STATES) do
   if c:GetAttribute("State_"..name)==true then return name end
@@ -1089,13 +1090,18 @@ local function startSession(now,candidate,calibration)
  local okServer,sendServer=pcall(function() return workspace:GetServerTimeNow() end)
  if not send("Block Input") then return false end
  lastSent=now
- -- The grant is only visible on this client after outbound + server + the
- -- 0.236s replication step, so the deadline has to clear the *observed* lag
- -- plus a margin; a deadline derived from a stale grantLag ended sessions
- -- before the attribute replicated and logged phantom "no grant" misses.
- local wait=math.max(SESSION_MIN,state.grantLag+GRANT_MARGIN)
+ -- C12: Key deadline to impact time, not grantLag. The session should end
+ -- just after the expected impact, not after a lag-based guess.
+ local impactIn=candidate and candidate.remaining or nil
+ local deadline
+ if impactIn then
+  deadline=now+impactIn+parryWindow()+GRANT_MARGIN
+ else
+  local wait=math.max(SESSION_MIN,state.grantLag+GRANT_MARGIN)
+  deadline=now+math.min(PULSE_DEADLINE,wait)
+ end
  session={sentAt=now,sendServer=okServer and sendServer or nil,
-  deadline=now+math.min(PULSE_DEADLINE,wait),
+  deadline=deadline,
   calibration=calibration or nil}
  if not calibration then
   state.attempts+=1
@@ -1300,29 +1306,21 @@ local function step()
  if nearestInbound and not wasAttacking and manager and myRoot and not busy then
   local okA,isAttacking=pcall(function() return manager:HasState("Attacking") end)
   if okA and isAttacking then
-   -- AttackInput has no stop action (only LightAttack/HeavyAttack/Uppercut/
-   -- Slam/AirAttack), so a held M1 can only be released physically; a packet
-   -- cannot end a swing. Skip the injection when no mouse button is down.
-   local released=true
-   if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
-    local vim=game:GetService("VirtualInputManager")
-    released=pcall(function() vim:SendMouseButtonEvent(0,0,0,false,game,0) end)
-   end
-   if released then
-    wasAttacking=true
-    resumeAt=now+nearestInbound+0.25
-    log(string.format("released attack for inbound %s (%.2fs)",nearestInboundName,nearestInbound))
+   -- C12: Release via AttackInput packet (no VirtualInputManager).
+   if attackInput and type(attackInput.send)=="function" then
+    local ok=pcall(function() attackInput.send({Action="End Attack",SprintAttack=false}) end)
+    if ok then
+     wasAttacking=true
+     resumeAt=now+nearestInbound+0.25
+     log(string.format("released attack for inbound %s (%.2fs)",nearestInboundName,nearestInbound))
+    end
    end
   end
  end
  if wasAttacking and (busy or (now>=resumeAt and not nearestInbound)) then
-  -- Resume through the packet the client itself uses, so it still works when
-  -- synthetic mouse input is filtered; fall back to the mouse if unavailable.
+  -- C12: Resume via AttackInput packet.
   if attackInput and type(attackInput.send)=="function" then
-   pcall(function() attackInput.send({Action="LightAttack",SprintAttack=false}) end)
-  else
-   local vim=game:GetService("VirtualInputManager")
-   pcall(function() vim:SendMouseButtonEvent(0,0,0,true,game,0) end)
+   pcall(function() attackInput.send({Action="Attack",SprintAttack=false}) end)
   end
   wasAttacking=false
   log("resumed attack")
