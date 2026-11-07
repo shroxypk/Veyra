@@ -3494,7 +3494,9 @@ local function step()
    end
   end
  end
- if not reason and (not parry or not parry.enabled) then
+ -- Unknown animations are exactly the hits parry cannot cover, whether parry
+ -- is on or not: unprofiledImpact() excludes every asset parry knows.
+ if not reason then
   local unprofiled=unprofiledImpact(parry)
   if unprofiled and unprofiled<=ROLL_LEAD and unprofiled>=-0.05 then
    reason=string.format("unprofiled impact %.2fs",unprofiled)
