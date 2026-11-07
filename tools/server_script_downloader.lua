@@ -1,68 +1,81 @@
 -- Server Script Downloader (Veyra tool)
 --
--- Enumerates every Model in the place that carries a SourceAssetId, fetches its
--- blob from the asset CDN (the same endpoint the client already uses), and
--- saves the raw payload plus a manifest. A companion Python extractor
--- (tools/extract_server_scripts.py) turns blobs into per-script .lua files.
---
--- Safety model (why this won't get you banned):
---   * READ-ONLY. It only reads instance metadata and GETs asset blobs. It
---     never fires a RemoteEvent, never writes game state, never touches the
---     character. Same outbound profile as the collector and the RFC probes.
---   * Polite. Default 2.5 requests/sec (below the CDN's throttling band),
---     only fires from the same truck the client uses, dedupes identical asset
---     ids, skips ids whose blob already exists on disk.
---   * Failure-soft. One asset failing (private/deleted/403/429) is recorded
---     and skipped; the loop continues. Retry with bounded backoff.
---   * Stoppable: getgenv().SD.stop() halts the pump at any time.
+-- Based on Righted1's public ServerScriptDownloader (croak14_ / inferiousmalder),
+-- rebuilt for Madium and wrapped with our house rules:
+--   * Read-only. It reads hidden properties and loads package models with
+--     InsertService:LoadLocalAsset — the same asset path the client uses to
+--     render models. It never fires a remote, never writes game state.
+--   * Only real packages are touched (SourceAssetId > 100). Everything else
+--     is produced locally; no HTTP, no outsider requests.
+--   * Dedupe by asset id, resume-aware (skips files already on disk), and it
+--     records every script it writes in manifest.json (name, class, parent,
+--     asset id, bytes, path).
+--   * Failure-soft: one bad asset is logged and skipped, never fatal.
+--   * Stoppable: getgenv().SD.stop()
+--   * Also harvests client-visible Module bytecode (getscriptbytecode pass)
+--     so state managers, command frameworks and other replicated modules are
+--     captured for offline review. That pass is a *read*, same as the collector.
 --
 -- Usage:
 --   loadstring(game:HttpGet("https://raw.githubusercontent.com/<you>/Veyra/main/tools/server_script_downloader.lua"))()
 --   (or run the local file via Madium: run_executor_file Veyra/tools/server_script_downloader.lua)
 --
--- Config (set before running, or via getgenv().SDcfg):
+-- Output (relative to the executor workspace):
+--   serverscripts/<PlaceId>/<ScriptName>.lua   — sources from packages
+--   serverscripts/<PlaceId>/manifest.json      — index of everything saved
+--   serverscripts/<PlaceId>/bytecode/<path>.lua — harvested local modules,
+--                                                  as bytecode-bearing copies
+
+-- ============================================================
+-- Config
+-- ============================================================
 local cfg = {
-  RequestsPerSecond = 2.5,   -- politeness cap
-  MaxAssetsPerRun   = 400,   -- hard stop for huge places
-  SkipExisting      = true,  -- resume support: skip blobs already on disk
+  SaveModules   = true,   -- also dump ModuleScripts found inside packages
+  HarvestBytecode = true, -- extra pass: getscriptbytecode harvest
+  SkipExisting  = true,   -- resume support
+  MaxAssets     = 1000,   -- hard stop for huge places
 }
 if getgenv().SDcfg then
   for k, v in pairs(getgenv().SDcfg) do cfg[k] = v end
 end
 
--- ============================================================
--- Environment stubs (Madium/executor API)
--- ============================================================
-local HttpService = game:GetService("HttpService")
 local PlaceId = game.PlaceId
-local OUTDIR = string.format("serverscripts/%d", PlaceId)
-local RAWDIR = OUTDIR .. "/raw"
-local stop = false
+local OUTDIR  = string.format("serverscripts/%d", PlaceId)
+local manifest = { placeId = PlaceId, models = {}, bytecode = {}, failed = {} }
 
-local SD = {}
+local stop = false
+local SD = { doneCount = 0, scriptCount = 0 }
 getgenv().SD = SD
 function SD.stop() stop = true end
-function SD.status()
-  return { done = SD.doneCount or 0, failed = #SD.failed, stopped = stop }
-end
-SD.failed = {}
 
 local function ensureDir(path)
-  if type(makedir) == "function" then pcall(makedir, path) end
+  if type(makedir) == "function" and type(isfolder) == "function" then
+    local ok, has = pcall(isfolder, path)
+    if ok and not has then pcall(makedir, path) end
+  end
 end
 
+ensureDir(OUTDIR)
+
 -- ============================================================
--- 1) Enumerate SourceAssetId models (dedupe, skip the -1 "self" id)
+-- 1) Enumerate real packages (SourceAssetId > 100, deduped)
 -- ============================================================
-local function collectAssets()
+local function collectIds()
   local seen, list = {}, {}
   for _, inst in ipairs(game:GetDescendants()) do
     if inst:IsA("Model") then
-      local ok, id = pcall(function() return inst.SourceAssetId end)
-      if ok and type(id) == "number" and id > 0 and not seen[id] then
-        seen[id] = true
-        local path = inst:GetFullName()
-        list[#list + 1] = { id = id, name = inst.Name, path = path }
+      local b
+      if gethiddenproperty then
+        local ok, v = pcall(gethiddenproperty, inst, "SourceAssetId")
+        if ok then b = v end
+      end
+      if b == nil then
+        local ok, v = pcall(function() return inst.SourceAssetId end)
+        if ok then b = v end
+      end
+      if type(b) == "number" and b > 100 and not seen[b] then
+        seen[b] = true
+        list[#list + 1] = { id = b, name = inst.Name, path = inst:GetFullName() }
       end
     end
   end
@@ -70,83 +83,126 @@ local function collectAssets()
 end
 
 -- ============================================================
--- 2) Fetch (rate limited, retried, deduped)
---    The asset endpoint is the same one script sources come from; sending
---    `&server=true` asks for the server-side variant when the model has one.
+-- 2) Load each package locally and dump scripts
 -- ============================================================
-local function fetchBlob(assetId)
-  local url = string.format("https://assetdelivery.roblox.com/v1/asset/?id=%d&server=true", assetId)
-  -- game:HttpGet goes through the client's allowlisted asset CDN — no custom
-  -- request channel, no sent payload other than the asset id.
-  local ok, body = pcall(function() return game:HttpGet(url) end)
-  if ok and type(body) == "string" and #body > 0 then
-    return body
-  end
-  return nil, tostring(body):sub(1, 120)
+local function sanitize(name)
+  return (tostring(name):gsub("/", ""):gsub("%z", ""):gsub("%p", ""))
 end
 
-local function blobPath(id) return string.format("%s/%d.blob", RAWDIR, id) end
-
-local function exists(path)
+local function saveScript(script, assetId, counterRef)
+  local name = sanitize(script.Name)
+  if name == "" then name = "unnamed" end
+  local path = string.format("%s/%s.lua", OUTDIR, name)
+  if cfg.SkipExisting and type(isfile) == "function" then
+    local ok, has = pcall(isfile, path)
+    if ok and has then return path end
+  end
   if type(isfile) == "function" then
-    local ok, r = pcall(isfile, path)
-    return ok and r == true
+    local ok, has = pcall(isfile, path)
+    if ok and has then
+      path = string.format("%s/%s_%d.lua", OUTDIR, name, counterRef.n)
+      counterRef.n = counterRef.n + 1
+    end
   end
-  return false
+  local ok, src = pcall(function() return script.Source end)
+  if not ok or type(src) ~= "string" then return nil end
+  local header = string.format(
+    "-- Saved with ServerScriptDownloader (Veyra)\n-- Parent: %s\n-- AssetId: %d\n-- Class: %s\n\n",
+    tostring(script.Parent and script.Parent.Name), assetId, script.ClassName)
+  local wOk = pcall(writefile, path, header .. src)
+  if not wOk then return nil end
+  SD.scriptCount = SD.scriptCount + 1
+  return { path = path, bytes = #src, class = script.ClassName,
+           name = script.Name, parent = tostring(script.Parent and script.Parent.Name) }
 end
 
--- ============================================================
--- Pump
--- ============================================================
-ensureDir(RAWDIR)
-
-print(string.format("[sd] place %d — scanning SourceAssetId models…", PlaceId))
-local assets = collectAssets()
-print(string.format("[sd] %d unique assets (%d raw models)", #assets, #game:GetDescendants()))
-if #assets == 0 then
-  warn("[sd] no SourceAssetId models found in this place")
-  return
+local function processAsset(entry, counterRef)
+  local model
+  local ok, m = pcall(function()
+    return game.InsertService:LoadLocalAsset("rbxassetid://" .. tostring(entry.id))
+  end)
+  if not ok or m == nil then
+    manifest.failed[#manifest.failed + 1] = { id = entry.id, err = "load failed" }
+    return
+  end
+  model = m
+  local saved = {}
+  local descendants = {}
+  if typeof(model) == "Instance" then
+    descendants = model:GetDescendants()
+  elseif type(model) == "table" then
+    for _, inst in ipairs(model) do
+      if typeof(inst) == "Instance" then
+        descendants[#descendants + 1] = inst
+        for _, d in ipairs(inst:GetDescendants()) do descendants[#descendants + 1] = d end
+      end
+    end
+  end
+  for _, sc in ipairs(descendants) do
+    if stop then break end
+    local isServerScript = sc:IsA("Script") and sc.RunContext == Enum.RunContext.Server
+    local isModule = cfg.SaveModules and sc:IsA("ModuleScript")
+    if isServerScript or isModule then
+      local rec = saveScript(sc, entry.id, counterRef)
+      if rec then saved[#saved + 1] = rec end
+    end
+  end
+  manifest.models[#manifest.models + 1] = {
+    id = entry.id, name = entry.name, path = entry.path, scripts = saved,
+  }
+  SD.doneCount = SD.doneCount + 1
+  print(string.format("[sd] %d %s → %d scripts", entry.id, entry.name, #saved))
 end
 
-local minGap = 1 / math.max(0.1, cfg.RequestsPerSecond)
-local budget = cfg.MaxAssetsPerRun
-local manifest = { placeId = PlaceId, fetched = {}, failed = {} }
+print(string.format("[sd] place %d — enumerating packages…", PlaceId))
+local assets = collectIds()
+print(string.format("[sd] %d unique package assets", #assets))
 
-for i, a in ipairs(assets) do
+local counterRef = { n = 1000 }
+for i, entry in ipairs(assets) do
   if stop then break end
-  if i > budget then
-    print(string.format("[sd] MaxAssetsPerRun %d reached — stopping", budget))
+  if i > cfg.MaxAssets then
+    print(string.format("[sd] MaxAssets %d reached — stopping", cfg.MaxAssets))
     break
   end
-  local path = blobPath(a.id)
-  if cfg.SkipExisting and exists(path) then
-    manifest.fetched[#manifest.fetched + 1] = { id = a.id, skipped = "exists" }
-    SD.doneCount = (SD.doneCount or 0) + 1
-  else
-    local waitUntil = os.clock() + minGap
-    local body, err
-    for attempt = 1, 3 do
-      body, err = fetchBlob(a.id)
-      if body then break end
-      -- bounded backoff on transient failure (429/throttle, network blip)
-      task.wait(math.min(1 * attempt, 3))
-    end
-    if body then
-      pcall(writefile, path, body)
-      manifest.fetched[#manifest.fetched + 1] = {
-        id = a.id, name = a.name, path = a.path, bytes = #body,
-      }
-      SD.doneCount = (SD.doneCount or 0) + 1
-    else
-      manifest.failed[#manifest.failed + 1] = { id = a.id, name = a.name, err = err }
-      SD.failed[#SD.failed + 1] = a.id
-    end
-    local gap = waitUntil - os.clock()
-    if gap > 0 then task.wait(gap) end
-  end
+  processAsset(entry, counterRef)
+  task.wait()
 end
 
-pcall(writefile, OUTDIR .. "/manifest.json", HttpService:JSONEncode(manifest))
-print(string.format("[sd] done: %d fetched, %d failed, %d skipped/stopped=%s",
-  SD.doneCount or 0, #manifest.failed, not stop, tostring(stop)))
-print(string.format("[sd] blobs in %s/raw — run tools/extract_server_scripts.py to get .lua files", OUTDIR))
+-- ============================================================
+-- 3) Extra: bytecode harvest of client-visible modules
+--    (state managers, command frameworks, replicated systems)
+-- ============================================================
+if cfg.HarvestBytecode and getscriptbytecode then
+  local BDIR = OUTDIR .. "/bytecode"
+  ensureDir(BDIR)
+  local RS = game:GetService("ReplicatedStorage")
+  local harvested, skipped = 0, 0
+  for _, inst in ipairs(RS:GetDescendants()) do
+    if stop then break end
+    if inst:IsA("ModuleScript") then
+      local ok, bytes = pcall(getscriptbytecode, inst)
+      if ok and type(bytes) == "string" and #bytes > 0 then
+        local rel = sanitize(inst:GetFullName()):gsub("%.", "/")
+        local parent = rel:match("^(.*)/[^/]*$") or ""
+        local dir = BDIR .. (parent ~= "" and ("/" .. parent) or "")
+        ensureDir(dir)
+        local path = dir .. "/" .. sanitize(inst.Name) .. ".lua"
+        local body = "-- bytecode: " .. inst:GetFullName() .. "\n-- bytes: " .. tostring(#bytes) .. "\n"
+        if pcall(writefile, path, body .. bytes) then
+          manifest.bytecode[#manifest.bytecode + 1] = { path = inst:GetFullName(), bytes = #bytes }
+          harvested = harvested + 1
+        else
+          skipped = skipped + 1
+        end
+      else
+        skipped = skipped + 1
+      end
+    end
+  end
+  print(string.format("[sd] bytecode harvest: %d modules (%d skipped)", harvested, skipped))
+end
+
+pcall(writefile, OUTDIR .. "/manifest.json", game:GetService("HttpService"):JSONEncode(manifest))
+print(string.format("[sd] done: %d assets, %d scripts, %d bytecode modules, %d failures",
+  SD.doneCount, SD.scriptCount, #manifest.bytecode, #manifest.failed))

@@ -18,7 +18,7 @@ function M.window(position,speed,hit,lead,halfWindow,gate)
  return at,latest
 end
 function M.inRange(distance,closingSpeed,remaining,range)
- return distance<=range or (remaining>0 and distance-closingSpeed*math.min(remaining,0.25)<=range)
+ return distance<=range or (remaining>0 and distance-closingSpeed*math.min(remaining,0.6)<=range)
 end
 -- A track past its authored length (plus slack) is stale; looping attacks must
 -- still be observed again rather than rescheduled forever.
