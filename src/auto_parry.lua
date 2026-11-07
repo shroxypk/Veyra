@@ -1204,7 +1204,10 @@ local function step()
  -- Chained presses are scheduled by later frames: a hit only enters the
  -- eligible set once its own press window opens, so a single press per frame
  -- is the whole scheduler. Nothing is pressed early for a future impact.
- if best and now-lastSent>=PRESS_RATE and now>=notBefore then
+ -- C9: While Burning, suppress presses (burn ticks are unparryable) but
+ -- keep the chain plan alive for real animations.
+ local isBurning = char and char:GetAttribute("State_Burning")==true
+ if best and not isBurning and now-lastSent>=PRESS_RATE and now>=notBefore then
   pendingGate=best.gate
   if startSession(now,best,false) then
    activeAttempt.asset=best.id
