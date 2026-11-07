@@ -868,6 +868,38 @@ local function isUnparryable(candidate)
  return false
 end
 
+-- RTT estimation (C6): rolling median of 8 samples.
+-- Pair workspace:GetServerTimeNow() with os.clock() to estimate round-trip time.
+local rttSamples={}
+local function updateRTT()
+  local ok,server=pcall(function() return workspace:GetServerTimeNow() end)
+  if not ok or type(server)~="number" then return end
+  local localNow=os.clock()
+  -- Poll a second time to estimate one-way leg; the delta between the two
+  -- server times minus local elapsed gives the outbound leg.
+  task.wait()
+  local ok2,server2=pcall(function() return workspace:GetServerTimeNow() end)
+  if not ok2 or type(server2)~="number" then return end
+  local localNow2=os.clock()
+  local rtt=(server2-server)-(localNow2-localNow)
+  -- rtt here is (server elapsed) - (local elapsed). If clocks run at 1x, this
+  -- approximates the extra network delay. We store it as a raw RTT estimate.
+  -- Clamp to sane bounds (0..500ms).
+  rtt=math.clamp(rtt*1000,0,500)
+  rttSamples[#rttSamples+1]=rtt
+  if #rttSamples>8 then table.remove(rttSamples,1) end
+end
+
+local function getRTT()
+  if #rttSamples==0 then return 0.06 end -- default ~60ms outbound estimate
+  -- Use median
+  local sorted={}
+  for _,v in ipairs(rttSamples) do sorted[#sorted+1]=v end
+  table.sort(sorted)
+  local mid=math.floor(#sorted/2)
+  return (sorted[mid+1] or 60)/1000 -- convert ms to seconds
+end
+
 local function hasLOS(root, other)
  local params = RaycastParams.new()
  params.FilterDescendantsInstances = {player.Character, other.Parent}
@@ -884,15 +916,23 @@ local function incoming(candidate,root,remaining)
  if not h or h.Health<=0 or not other then return false,"attacker unavailable" end
  if interrupted(model) then return false,"attacker interrupted" end
  if isUnparryable(candidate) then return false,"unparryable move" end
- local delta=root.Position-other.Position
+ -- C6: Lag compensation - extrapolate attacker position by velocity * RTT/2.
+ -- The attacker's root on this client is slightly behind where it is on the server.
+ -- Clamp total extrapolation travel to 0.12s.
+ local rtt=getRTT()
+ local extrapolateTime=math.min(rtt/2,0.12)
+ local vel=other.AssemblyLinearVelocity
+ local extrapolatedPos=other.Position + vel*extrapolateTime
+ local delta=root.Position-extrapolatedPos
  local distance=delta.Magnitude
  local reach = getReach(candidate)
  local isCloseSpin = distance < 8
  if math.abs(delta.Y)>10 then return false,"height" end
  local direction=delta.Unit
- local closing=(other.AssemblyLinearVelocity-root.AssemblyLinearVelocity):Dot(direction)
+ local closing=(vel-root.AssemblyLinearVelocity):Dot(direction)
  local effectiveRange = math.min(state.range or reach, reach+2)
  if not timing.inRange(distance,closing,remaining,effectiveRange) then return false,string.format("range %.1f/%.1f",distance,effectiveRange) end
+ -- Facing check uses extrapolated position but actual CFrame
  if not isCloseSpin and other.CFrame.LookVector:Dot(direction)<0.25 then return false,"attacker facing away" end
  if not hasLOS(root, other) then return false,"no LOS" end
  return true
@@ -931,6 +971,11 @@ local function step()
  if session and now>=session.deadline then endSession("timeout") end
  if deriveDirty and now>=deriveSaveAt then deriveSaveAt=now+2 saveDerived() end
  if now>=nextScan then nextScan=now+0.4 scan() end
+ -- Update RTT samples periodically (every ~2s)
+ if not step.lastRTTUpdate or now-step.lastRTTUpdate>2 then
+  step.lastRTTUpdate=now
+  task.spawn(updateRTT)
+ end
  flushSiIfNeeded()
 
  local root,reason=ready()
