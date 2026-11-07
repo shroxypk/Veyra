@@ -5,15 +5,18 @@
 --   * lead/grantLag: calibrated from every observed grant (StateEnd_Parrying - StateDuration_Parrying - sendServerTime)
 --   * bias: per-asset timing correction from damage residuals (early/late when grant observed)
 --   * mobReach: learned from distance at impact when grant+damage confirm a hit
---   * unparryable: verified - if State_ParriedAttack fires for listed ID, it's removed
+--   * unparryable: tri-state - true = confirmed unparryable, false = verified
+--     parryable (never re-suppressed), nil = base list / unknown
+--   * unparryableStrikes: ambiguous hits per asset before it is confirmed
+--   * parryWindow: learned from StateDuration_Parrying (default 0.30s)
 --   * clusterThreshold: per-asset, learned from hit spacing in profile
---   * derivedHitOffset: per-asset, learned from calibration grant residuals
+--   * derivedHitOffset: per-asset offset used when deriving new profiles
 --   * attackClassification: pose-velocity threshold (6 studs/s) + name filter
 --   * All learned data persists in Veyra/config.json and Veyra/parry_derived.json
 --
 -- Mechanics measured in-game:
 --   * Block Input grants State_Parrying after ~round-trip latency
---   * Granted parry lives PARRY_WINDOW seconds and survives End Block
+--   * Granted parry lives for StateDuration_Parrying (~0.30s) and survives End Block
 --   * ParryCooldown gates next grant
 --   * Repeating Block Input while blocking cannot create second parry
 
@@ -34,8 +37,10 @@ local resumeAt=0
 local prefs=G.VeyraConfig and G.VeyraConfig.values and G.VeyraConfig.values.parry or {}
 local function cfg(key,def) return prefs[key] or def end
 
-local PARRY_WINDOW=cfg("parryWindow",0.25)
-local SESSION_MIN=cfg("sessionMin",0.16)
+local PARRY_WINDOW=cfg("parryWindow",0.3)
+local SESSION_MIN=cfg("sessionMin",0.3)
+local GRANT_MARGIN=cfg("grantMargin",0.12)
+local UNPARRY_CONFIRM=cfg("unparryConfirm",2)
 local PULSE_DEADLINE=cfg("pulseDeadline",0.55)
 local PRESS_RATE=cfg("pressRate",0.35)
 local ATTACK_RELEASE_HORIZON=cfg("releaseHorizon",0.8)
@@ -54,9 +59,11 @@ local function loadSelfImproving()
     return {
         lead = saved.lead or cfg("lead",0.1),
         grantLag = saved.grantLag or cfg("grantLag",0.15),
+        parryWindow = saved.parryWindow or PARRY_WINDOW,
         bias = saved.bias or {},
         mobReach = saved.mobReach or {},
         unparryable = saved.unparryable or {},
+        unparryableStrikes = saved.unparryableStrikes or {},
         clusterThreshold = saved.clusterThreshold or {},
         derivedHitOffset = saved.derivedHitOffset or {},
         calibrated = saved.calibrated or false,
@@ -67,6 +74,7 @@ local si = loadSelfImproving()
 
 local state={enabled=false,alive=true,status="Parry off",profiles=profileCount,
  range=cfg("range",14),leadOffset=0,lead=si.lead,grantLag=si.grantLag,
+ parryWindow=si.parryWindow,
  attempts=0,grants=0,confirmed=0,damageEvents=0,
  unknown=0,missed=0,covered=0,gated=0,learned=0,calibrated=si.calibrated,
  bias=si.bias,hitResiduals={},
@@ -75,12 +83,19 @@ local state={enabled=false,alive=true,status="Parry off",profiles=profileCount,
  unknownAssets={},derived=0,log={},
  orphans={},lockKind=nil,impactIsOrphan=false,pressing=false,
  -- Self-improving runtime state
- mobReach = si.mobReach,           -- id -> reach (learned from impacts)
- unparryableVerified = si.unparryable, -- id -> true (verified unparryable)
+ mobReach = si.mobReach,           -- id -> reach (learned from confirmed deflections)
+ unparryableVerified = si.unparryable, -- id -> true/false (confirmed unparryable / verified parryable)
+ unparryableStrikes = si.unparryableStrikes, -- id -> ambiguous hit count
  clusterThreshold = si.clusterThreshold, -- id -> threshold (learned from hit spacing)
  derivedHitOffset = si.derivedHitOffset, -- id -> offset (learned from residuals)
 }
 G.VeyraParry=state
+
+-- The granted window is measured, not assumed: every grant carries
+-- StateDuration_Parrying, so the model uses the observed value once it has one.
+local function parryWindow()
+ return state.parryWindow or PARRY_WINDOW
+end
 
 -- ============================================================
 -- PERSISTENCE HELPERS
@@ -91,9 +106,11 @@ local function saveSelfImproving()
         selfImproving = {
             lead = state.lead,
             grantLag = state.grantLag,
+            parryWindow = state.parryWindow,
             bias = state.bias,
             mobReach = state.mobReach,
             unparryable = state.unparryableVerified,
+            unparryableStrikes = state.unparryableStrikes,
             clusterThreshold = state.clusterThreshold,
             derivedHitOffset = state.derivedHitOffset,
             calibrated = state.calibrated,
@@ -120,7 +137,7 @@ end
 local animators,watches,pending={},{},{}
 local discoveryAdded,discoveryRemoved
 local seen=setmetatable({},{__mode="k"})
-local worker,packet,manager,character,healthConnection,attributeConnection
+local worker,packet,attackInput,manager,character,healthConnection,attributeConnection
 local session=nil
 local lastSent=-math.huge
 local nextScan=0
@@ -227,11 +244,9 @@ local function attackLike(track)
  if not animation then return false end
  local id=animation.AnimationId:match("%d+")
  if not id or suitOnly[id] then return false end
- -- Pose-velocity threshold: if max pose speed > 6, it's an attack regardless of name
- local maxSpeed=0
- for _,keyframe in ipairs(track:GetKeyframeSequenceDescriptor():GetChildren()) do
-  -- Can't easily get pose speeds here, fallback to name filter
- end
+ -- Pose speed is only available from the keyframe provider, which is an async
+ -- fetch; the name filter is the cheap synchronous classifier here and the
+ -- derived profile gets the real pose pass in derive().
  return nameIsAttack(animation.Name),id
 end
 
@@ -275,7 +290,7 @@ local function poseFrames(sequence)
  return frames,previousTime or 0
 end
 
-local function deriveHits(frames,length)
+local function deriveHits(frames,length,id)
  local maxSpeed=0
  for _,frame in ipairs(frames) do if frame.s>maxSpeed then maxSpeed=frame.s end end
  if maxSpeed<6 then return nil end
@@ -297,15 +312,15 @@ local function deriveHits(frames,length)
   end
  end
  if #peaks==0 then return nil end
- -- Cluster threshold: use per-asset learned or default 0.28
- local clusterThresh = 0.28
+ -- Cluster threshold and scheduling offset are per-asset once the fight data
+ -- has taught them; until then use the measured defaults.
+ local clusterThresh=(id and state.clusterThreshold[id]) or 0.28
+ local offset=(id and state.derivedHitOffset[id]) or 0.03
  local hits,cluster={},{peaks[1]}
  for cursor=2,#peaks do
   if peaks[cursor]-cluster[#cluster]<=clusterThresh then
    cluster[#cluster+1]=peaks[cursor]
   else
-   -- Use per-asset derivedHitOffset or default 0.03
-   local offset = 0.03
    hits[#hits+1]=(cluster[1]+cluster[#cluster])/2+offset
    cluster={peaks[cursor]}
   end
@@ -330,7 +345,7 @@ local function derive(id,name)
   local parsed,frames,length=pcall(poseFrames,sequence)
   sequence:Destroy()
   if not state.alive or not parsed or #frames<2 then return end
-  local hits=deriveHits(frames,length)
+  local hits=deriveHits(frames,length,id)
   if not hits then return end
   local profile={name=name or ("asset "..id),length=length,hits=hits,derived=true}
   if not validProfile(profile) then return end
@@ -393,10 +408,18 @@ local function bindCharacter(c)
       local residual=now-activeAttempt.impactAt
       if math.abs(residual)<=0.4 then
        local granted=activeAttempt.granted==true
-       local oc=granted and timing.outcome(residual,PARRY_WINDOW,-0.02) or "unobserved"
+       local oc=granted and timing.outcome(residual,parryWindow(),-0.02) or "unobserved"
        if granted and oc=="inside" then
-        local strikes=(state.unparryableVerified[activeAttempt.asset] or 0)+1
-        state.unparryableVerified[activeAttempt.asset]=strikes
+        -- A hit that lands on the predicted frame while a parry was granted is
+        -- ambiguous, not proof: it may be a second strike of the same clip.
+        -- Count them separately from the confirmed-unparryable set and only
+        -- promote after UNPARRY_CONFIRM of them with no deflection.
+        local strikes=(state.unparryableStrikes[activeAttempt.asset] or 0)+1
+        state.unparryableStrikes[activeAttempt.asset]=strikes
+        if strikes>=UNPARRY_CONFIRM and state.unparryableVerified[activeAttempt.asset]~=true then
+         state.unparryableVerified[activeAttempt.asset]=true
+         log(string.format("unparryable confirmed: %s (%d strikes)",activeAttempt.asset,strikes))
+        end
         table.insert(state.hitResiduals,string.format("%s %+.3f near prediction -> ambiguous (%d)",
          activeAttempt.name,residual,strikes))
         note=note..string.format(" residual %+.3fs near prediction (ambiguous damage)",residual)
@@ -410,6 +433,14 @@ local function bindCharacter(c)
          log(string.format("bias %s: %+.4f",activeAttempt.asset,state.bias[activeAttempt.asset]))
          markSiDirty()
         end
+       end
+       -- A hit that landed means this attacker really does reach that far:
+       -- fold the press-time distance into the per-asset reach estimate.
+       if granted and activeAttempt.distance and activeAttempt.asset then
+        local current=state.mobReach[activeAttempt.asset] or 8
+        state.mobReach[activeAttempt.asset]=math.clamp(current*0.85+activeAttempt.distance*0.15,5,14)
+        log(string.format("reach %s: %.1f",activeAttempt.asset,state.mobReach[activeAttempt.asset]))
+        markSiDirty()
        end
        while #state.hitResiduals>20 do table.remove(state.hitResiduals,1) end
       end
@@ -435,6 +466,11 @@ local function bindCharacter(c)
     end
     local endAt=c:GetAttribute("StateEnd_Parrying")
     local duration=c:GetAttribute("StateDuration_Parrying")
+    if duration and duration>0.05 and duration<1.5 then
+     -- The granted window is whatever the server says it is.
+     state.parryWindow=state.parryWindow*0.8+duration*0.2
+     markSiDirty()
+    end
     if endAt and duration and session.sendServer then
      local outbound=(endAt-duration)-session.sendServer
      if outbound>-0.05 and outbound<0.4 then
@@ -456,10 +492,13 @@ local function bindCharacter(c)
     if activeAttempt.asset then
      local id=activeAttempt.asset
      state.successByAsset[id]=(state.successByAsset[id] or 0)+1
-     -- UNPARRYABLE VERIFICATION: if we parried an "unparryable" ID, it's actually parryable
-     if state.unparryableVerified[id] then
-      state.unparryableVerified[id]=nil
-      log(string.format("UNPARRYABLE VERIFIED PARRYABLE: %s (removing from list)",id))
+     -- A confirmed deflection is proof of parryability: clear both the strike
+     -- counter and any confirmation, and record `false` so the base list can
+     -- never re-suppress this asset.
+     state.unparryableStrikes[id]=nil
+     if state.unparryableVerified[id]~=false then
+      state.unparryableVerified[id]=false
+      log(string.format("verified parryable: %s",id))
       markSiDirty()
      end
     end
@@ -470,16 +509,20 @@ local function bindCharacter(c)
  end)
 end
 
-local function gateReason(c)
- for _,name in ipairs({"Attacking","ParryCooldown","Parrying","Blocking","SwordBlocking",
-  "Stunned","SkillActive","Dodging","BlockBroken","Ragdoll","Occupied","Knocked","Downed",
-  "APF","Parried","ParriedAttack"}) do
+-- States that make a Block Input pointless or actively harmful. CanBlock()
+-- already covers Stunned/Occupied/Attacking/Critting/MisdirectActive plus
+-- blocking, dodging, incapacity, skill use and flight; these are the extra
+-- states the server refuses a parry in and CanBlock does not model.
+local HARD_STATES={"Carrying","Ragdolled","Climbing","Burning","CantCombat",
+ "CombatDebounce","BlockBroken","Ragdoll","Knocked","Downed","SkillActive"}
+local function hardBlocked(c)
+ for _,name in ipairs(HARD_STATES) do
   if c:GetAttribute("State_"..name)==true then return name end
  end
- return "CanParry=false"
+ return nil
 end
 
-local function ready(ignoreCooldown)
+local function ready(ignoreGrace)
  local c=player.Character
  local h=c and c:FindFirstChildOfClass("Humanoid")
  if not h or h.Health<=0 then return nil,"waiting for respawn" end
@@ -495,17 +538,14 @@ local function ready(ignoreCooldown)
  if code and UIS:IsKeyDown(code) then return nil,"manual block" end
  if not manager then return nil,"state manager unavailable" end
  if h:GetAttribute("InSafezone")==true then return nil,"safezone" end
- if not manager:CanParry() then
-  if not ignoreCooldown then return nil,gateReason(c) end
-  -- ignoreCooldown: cooldown/grace states are the lock model's business; only
-  -- hard blockers (stun, dodge, skill, attack, manual block) stop the plan.
-  if manager:IsBlocking() or manager:IsIncapacitated() or manager:IsDodging()
-   or manager:IsUsingSkill() or manager:IsFlying()
-   or manager:HasAnyState("Occupied","Attacking") then
-   return nil,gateReason(c)
-  end
+ -- CanBlock, not CanParry: ParryCooldown and Parrying are the lock model's
+ -- business, and gating on them here would make every cooldown look like a
+ -- hard blocker. CanBlock is the authoritative "may I send Block Input" check.
+ local ok,blockable=pcall(function() return manager:CanBlock() end)
+ if not ok or not blockable then
+  return nil,hardBlocked(c) or "CanBlock=false"
  end
- if c:GetAttribute("State_APF")==true and not ignoreCooldown then return nil,"APF grace" end
+ if c:GetAttribute("State_APF")==true and not ignoreGrace then return nil,"APF grace" end
  return root
 end
 
@@ -671,10 +711,12 @@ local UNPARRYABLE_BASE = {
 }
 
 local function isUnparryable(candidate)
- if candidate.id and state.unparryableVerified[candidate.id] then return true end
- if candidate.id and UNPARRYABLE_BASE[candidate.id] and not state.unparryableVerified[candidate.id] then
-  -- In base list but not yet verified - suppress but allow verification
-  return true
+ local id=candidate.id
+ if id then
+  local verdict=state.unparryableVerified[id]
+  if verdict==true then return true end
+  if verdict==false then return false end -- verified parryable, never re-suppress
+  if UNPARRYABLE_BASE[id] then return true end -- base list, not yet tested
  end
  local n = (candidate.name or ""):lower()
  if n:find("grab") or n:find("throw") or n:find("slam") or n:find("stomp")
@@ -713,17 +755,26 @@ local function incoming(candidate,root,remaining)
  return true
 end
 
-local function startSession(now,name,calibration)
+local function startSession(now,candidate,calibration)
  local okServer,sendServer=pcall(function() return workspace:GetServerTimeNow() end)
  if not send("Block Input") then return false end
  lastSent=now
+ -- The grant is only visible on this client after outbound + server + the
+ -- 0.236s replication step, so the deadline has to clear the *observed* lag
+ -- plus a margin; a deadline derived from a stale grantLag ended sessions
+ -- before the attribute replicated and logged phantom "no grant" misses.
+ local wait=math.max(SESSION_MIN,state.grantLag+GRANT_MARGIN)
  session={sentAt=now,sendServer=okServer and sendServer or nil,
-  deadline=now+math.min(PULSE_DEADLINE,math.max(SESSION_MIN,state.grantLag+0.06)),
+  deadline=now+math.min(PULSE_DEADLINE,wait),
   calibration=calibration or nil}
  if not calibration then
   state.attempts+=1
-  activeAttempt={name=name,time=now}
-  log(string.format("input %s lead=%.3f gate=%s",name,state.lead,
+  local distance
+  local myRoot=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+  local other=candidate.model and candidate.model:FindFirstChild("HumanoidRootPart")
+  if myRoot and other then distance=(myRoot.Position-other.Position).Magnitude end
+  activeAttempt={name=candidate.name,time=now,model=candidate.model,distance=distance}
+  log(string.format("input %s lead=%.3f gate=%s",candidate.name,state.lead,
    pendingGate and string.format("%.2f",pendingGate) or "-"))
  else
   log("calibration pulse; waiting for grant")
@@ -740,7 +791,6 @@ local function step()
  flushSiIfNeeded()
 
  local root,reason=ready()
- local available=root~=nil
  local myRoot=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
  local nearestInbound,nearestInboundName,nearestInboundId
  local notBefore=-math.huge
@@ -799,24 +849,28 @@ local function step()
      nearestInboundId=candidate.id
     end
    end
-   -- Learn cluster threshold from hit spacing in this profile
-   if candidate.id and #(candidate.hits or {}) > 1 then
+   -- Learn this asset's merge threshold from the smallest gap between two
+   -- distinct impacts in its profile. Pending entries carry a single `.hit`,
+   -- so the profile is the only place the spacing exists.
+   if candidate.id then
     local profile = profiles_[candidate.id] or derived[candidate.id]
-    if profile and profile.hits then
-     local maxGap = 0
+    if profile and profile.hits and #profile.hits > 1 then
+     local minGap = math.huge
      for j=2,#profile.hits do
-      maxGap = math.max(maxGap, profile.hits[j] - profile.hits[j-1])
+      minGap = math.min(minGap, profile.hits[j] - profile.hits[j-1])
      end
-     if maxGap > 0 and maxGap < 1 then
-      local learned = math.min(maxGap * 1.1, 0.5) -- 10% margin, cap at 0.5
-      state.clusterThreshold[candidate.id] = learned
-      markSiDirty()
+     if minGap > 0 and minGap < 2 then
+      local learned = math.clamp(minGap * 0.9, 0.2, 0.6)
+      if math.abs((state.clusterThreshold[candidate.id] or 0) - learned) > 0.005 then
+       state.clusterThreshold[candidate.id] = learned
+       markSiDirty()
+      end
      end
     end
    end
    local effective=state.lead+state.leadOffset+(state.bias[candidate.id] or candidate.offset or 0)
    local at,latest=timing.window(position,track.Speed,candidate.hit,effective,
-    PARRY_WINDOW/2,candidate.gate)
+    parryWindow()/2,candidate.gate)
    if latest and latest< -0.05 then
     table.remove(pending,i)
     if candidate.covered then
@@ -860,7 +914,7 @@ local function step()
     best,bestLatest=entry.candidate,entry.latest
     best.remaining=entry.remaining
    end
-   coveredUntil=impactAt+PARRY_WINDOW/2
+   coveredUntil=impactAt+parryWindow()/2
    chainEnd=impactAt+GRACE_LOCK+0.03
   else
    state.orphans[#state.orphans+1]={remaining=entry.remaining,
@@ -878,16 +932,22 @@ local function step()
  else
   state.impactIsOrphan=false
  end
- state.parryWindowEnd = state.impactIn and (now + state.impactIn + PARRY_WINDOW) or nil
+ state.parryWindowEnd = state.impactIn and (now + state.impactIn + parryWindow()) or nil
 
  local minigames=G.VeyraMinigames
  local busy=minigames~=nil and (minigames.active==true or minigames.round~=nil)
  if nearestInbound and not wasAttacking and manager and myRoot and not busy then
   local okA,isAttacking=pcall(function() return manager:HasState("Attacking") end)
   if okA and isAttacking then
-   local vim=game:GetService("VirtualInputManager")
-   local ok=pcall(function() vim:SendMouseButtonEvent(0,0,0,false,game,0) end)
-   if ok then
+   -- AttackInput has no stop action (only LightAttack/HeavyAttack/Uppercut/
+   -- Slam/AirAttack), so a held M1 can only be released physically; a packet
+   -- cannot end a swing. Skip the injection when no mouse button is down.
+   local released=true
+   if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+    local vim=game:GetService("VirtualInputManager")
+    released=pcall(function() vim:SendMouseButtonEvent(0,0,0,false,game,0) end)
+   end
+   if released then
     wasAttacking=true
     resumeAt=now+nearestInbound+0.25
     log(string.format("released attack for inbound %s (%.2fs)",nearestInboundName,nearestInbound))
@@ -895,8 +955,14 @@ local function step()
   end
  end
  if wasAttacking and (busy or (now>=resumeAt and not nearestInbound)) then
-  local vim=game:GetService("VirtualInputManager")
-  pcall(function() vim:SendMouseButtonEvent(0,0,0,true,game,0) end)
+  -- Resume through the packet the client itself uses, so it still works when
+  -- synthetic mouse input is filtered; fall back to the mouse if unavailable.
+  if attackInput and type(attackInput.send)=="function" then
+   pcall(function() attackInput.send({Action="LightAttack",SprintAttack=false}) end)
+  else
+   local vim=game:GetService("VirtualInputManager")
+   pcall(function() vim:SendMouseButtonEvent(0,0,0,true,game,0) end)
+  end
   wasAttacking=false
   log("resumed attack")
  end
@@ -906,7 +972,7 @@ local function step()
  -- is the whole scheduler. Nothing is pressed early for a future impact.
  if best and now-lastSent>=PRESS_RATE and now>=notBefore then
   pendingGate=best.gate
-  if startSession(now,best.name,false) then
+  if startSession(now,best,false) then
    activeAttempt.asset=best.id
    activeAttempt.offset=best.offset
    activeAttempt.impactAt=now+best.remaining
@@ -925,14 +991,12 @@ local function step()
 end
 
 function state.setEnabled(on)
- _G.__PARRY_DEBUG = "SET_ENABLED CALLED: on="..tostring(on).." state.enabled="..tostring(state.enabled).." alive="..tostring(state.alive)
- log("SET_ENABLED CALLED: on="..tostring(on).." state.enabled="..tostring(state.enabled).." alive="..tostring(state.alive))
  if not state.alive then return false end
  on=on==true
- if on==state.enabled then log("EARLY RETURN: already enabled") return on end
+ if on==state.enabled then return on end
  if not on then
   state.enabled=false
-  log("DISABLE CALLED: "..debug.traceback("",2))
+  log("parry off")
   if worker then worker:Disconnect() worker=nil end
   if discoveryAdded then discoveryAdded:Disconnect() discoveryAdded=nil end
   if discoveryRemoved then discoveryRemoved:Disconnect() discoveryRemoved=nil end
@@ -942,13 +1006,13 @@ function state.setEnabled(on)
   state.status="Parry off"
   return false
  end
- log("ENABLING parry...")
  local ok,result=pcall(function() return require(storage.Modules.Packets).Combat.packets.BlockInput end)
  if not ok or not result or type(result.send)~="function" then
-  state.status="Parry: input unavailable" log("PACKET ERROR: "..tostring(result)) return false
+  state.status="Parry: input unavailable" log("packet error: "..tostring(result)) return false
  end
  packet=result
- log("Packet loaded OK")
+ local okAttack,attack=pcall(function() return require(storage.Modules.Packets).Combat.packets.AttackInput end)
+ attackInput=(okAttack and attack and type(attack.send)=="function") and attack or nil
  state.enabled=true nextScan=0
  discoveryAdded=workspace.DescendantAdded:Connect(function(item)
   if item:IsA("Animator") then animators[item]=true end
@@ -956,7 +1020,6 @@ function state.setEnabled(on)
  discoveryRemoved=workspace.DescendantRemoving:Connect(function(item)
   if animators[item] then animators[item]=nil unwatch(item) end
  end)
- log("Discovery connections set up")
  for _,name in ipairs({"FightableNPCS","NPCS"}) do
   local folder=workspace:FindFirstChild(name)
   if folder then
@@ -968,9 +1031,9 @@ function state.setEnabled(on)
    end
   end
  end
- log("Initial animators: "..tostring(#animators))
+ local animatorCount=0
+ for _ in pairs(animators) do animatorCount+=1 end
  bindCharacter(player.Character)
- log("Character bound")
  worker=RS.Heartbeat:Connect(function()
   local success,err=pcall(step)
   if not success then
@@ -979,7 +1042,8 @@ function state.setEnabled(on)
    state.status="Parry error: "..tostring(err)
   end
  end)
- log("Worker connected")
+ log(string.format("parry on · %d animators · %d profiles%s",animatorCount,profileCount,
+  attackInput and "" or " · no AttackInput"))
  return true
 end
 
