@@ -38,6 +38,7 @@ local prefs=G.VeyraConfig and G.VeyraConfig.values and G.VeyraConfig.values.parr
 local function cfg(key,def) return prefs[key] or def end
 
 local PARRY_WINDOW=cfg("parryWindow",0.3)
+local ROLL_DURATION=cfg("rollDuration",0.45)
 local SESSION_MIN=cfg("sessionMin",0.3)
 local GRANT_MARGIN=cfg("grantMargin",0.12)
 local UNPARRY_CONFIRM=cfg("unparryConfirm",2)
@@ -75,6 +76,7 @@ local si = loadSelfImproving()
 local state={enabled=false,alive=true,status="Parry off",profiles=profileCount,
  range=cfg("range",14),leadOffset=0,lead=si.lead,grantLag=si.grantLag,
  parryWindow=si.parryWindow,
+ rollDuration=ROLL_DURATION,
  attempts=0,grants=0,confirmed=0,damageEvents=0,
  unknown=0,missed=0,covered=0,gated=0,learned=0,calibrated=si.calibrated,
  bias=si.bias,hitResiduals={},
@@ -97,6 +99,11 @@ local function parryWindow()
  return state.parryWindow or PARRY_WINDOW
 end
 
+-- F4: Roll duration, learned the same way from StateDuration_Rolling.
+local function getAssetRollDuration()
+ return state.rollDuration or ROLL_DURATION
+end
+
 -- ============================================================
 -- PER-ASSET PARAMETER STORE (C1)
 -- ============================================================
@@ -104,6 +111,9 @@ local HttpService=game:GetService("HttpService")
 local LEARNED_PATH="Veyra/parry_learned.json"
 local LEARNED_VERSION=1
 local learned={version=LEARNED_VERSION,placeVersion=0,assets={}}
+
+-- F1: Forward-declare saveLearned so loadLearned's migration path can call it.
+local saveLearned
 
 -- C11: Store placeVersion; on change, mark all authored profiles stale.
 local function initPlaceVersion()
@@ -156,7 +166,7 @@ local function loadLearned()
     end
 end
 
-local function saveLearned()
+saveLearned=function()
     if type(writefile)~="function" then return end
     local ok,encoded=pcall(function() return HttpService:JSONEncode(learned) end)
     if not ok or type(encoded)~="string" then return end
@@ -166,6 +176,20 @@ end
 
 loadLearned()
 initPlaceVersion()
+
+-- F2: Debounced save for learned store (same pattern as markSiDirty).
+local learnedDirty=false
+local learnedSaveAt=0
+local function markLearnedDirty()
+  learnedDirty=true
+  learnedSaveAt=os.clock()+5
+end
+local function flushLearnedIfNeeded()
+  if learnedDirty and os.clock()>=learnedSaveAt then
+    learnedDirty=false
+    saveLearned()
+  end
+end
 
 -- Fallback chain: learned asset value -> static table -> class default -> hard default
 local function getAsset(id,key,classDefault,hardDefault)
@@ -179,13 +203,13 @@ end
 local function setAsset(id,key,value)
     learned.assets[id]=learned.assets[id] or {}
     learned.assets[id][key]=value
-    saveLearned()
+    markLearnedDirty()
 end
 
 local function incAssetStat(id,key,delta)
     learned.assets[id]=learned.assets[id] or {}
     learned.assets[id][key]=(learned.assets[id][key] or 0)+delta
-    saveLearned()
+    markLearnedDirty()
 end
 
 -- ============================================================
@@ -630,8 +654,7 @@ local function bindCharacter(c)
        table.insert(state.hitResiduals,string.format("%s %+.3f near prediction -> ambiguous (%d)",
         bestCand.cand.name,residual,strikes))
        note=note..string.format(" residual %+.3fs near prediction (ambiguous damage)",residual)
-       saveLearned()
-      else
+       markLearnedDirty()      else
        table.insert(state.hitResiduals,string.format("%s %+.3f %s damage",
         bestCand.cand.name,residual,oc))
        note=note..string.format(" residual %+.3fs (%s)",residual,oc)
@@ -682,6 +705,12 @@ local function bindCharacter(c)
      state.parryWindow=state.parryWindow*0.8+duration*0.2
      markSiDirty()
     end
+     -- F4: Learn roll duration from StateDuration_Rolling.
+     local rollDur=c:GetAttribute("StateDuration_Rolling")
+     if rollDur and rollDur>0.05 and rollDur<1.5 then
+      state.rollDuration=state.rollDuration*0.8+rollDur*0.2
+      markSiDirty()
+     end
     if endAt and duration and session.sendServer then
      local outbound=(endAt-duration)-session.sendServer
      if outbound>-0.05 and outbound<0.4 then
@@ -816,7 +845,7 @@ local function learnProfileShape(id)
   -- derivedHitOffset: not learnable from static data, keep default (0.03) until residuals teach it
   learned.assets[id]=learned.assets[id] or {}
   learned.assets[id].shapeLearned=true
-  saveLearned()
+  markLearnedDirty()
 end
 
 -- AoE classification (C7)
@@ -1130,6 +1159,7 @@ local function step()
   task.spawn(updateRTT)
  end
  flushSiIfNeeded()
+ flushLearnedIfNeeded()
 
  local root,reason=ready()
  local myRoot=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
@@ -1244,29 +1274,38 @@ local function step()
     j+=1
    end
    if #group==1 then
-    -- Single candidate, always parry
-    assign[i]="parry"
-   else
-    -- Multiple candidates within one lockout window
-    -- Evaluate: parry first + drop rest vs roll first + parry rest
-    local parryFirst=1 -- first is parried
-    for k=2,#group do
-     -- Can we parry subsequent hits if we parry first?
-     local nextImpact=now+group[k].remaining
-     if nextImpact>=impactAt+GRACE_LOCK+0.03 then
-      parryFirst=parryFirst+1
-     end
-    end
-    local rollFirst=#group-1 -- roll first, parry the rest
-    -- Choose whichever gives more parried hits; tie -> parry
-    if parryFirst>=rollFirst then
      assign[i]="parry"
-     for k=2,#group do assign[i+k-1]="roll" end
-    else
+   else
+    -- F4: Corrected coverage metric.
+    -- coveredFor(mode) = 1 + count of subsequent hits at least
+    -- (mode=="parry" and GRACE_LOCK or ROLL_DURATION+GRACE_LOCK) after first.
+    local rollDur=getAssetRollDuration()
+    local function coveredFor(mode)
+      -- F4: For parry mode, subsequent hits need GRACE_LOCK gap.
+      -- For roll mode, subsequent hits need ROLL_DURATION gap
+      -- (you can parry immediately after rolling ends).
+      local gap=(mode=="parry") and (GRACE_LOCK+0.03) or (rollDur+0.03)
+     local count=1
+     for k=2,#group do
+      local nextImpact=now+group[k].remaining
+      if nextImpact>=impactAt+gap then count=count+1 end
+     end
+     return count
+    end
+    -- Check if roll is available via CanDash
+    local canRollNow=false
+    if manager then
+     local ok,dash=pcall(function() return manager:CanDash() end)
+     canRollNow=ok and dash==true
+    end
+    if canRollNow and coveredFor("roll")>coveredFor("parry") then
      assign[i]="roll"
      for k=2,#group do assign[i+k-1]="parry" end
+    else
+     assign[i]="parry"
+     for k=2,#group do assign[i+k-1]="roll" end
     end
-   end
+    end
    i=j
   end
   -- Build orphans with kind
@@ -1441,6 +1480,7 @@ end
 function state.stop()
  state.setEnabled(false)
  saveDerived()
+ saveLearned()
  saveSelfImproving() -- Force save on stop
  state.alive=false
  if G.VeyraParry==state then G.VeyraParry=nil end

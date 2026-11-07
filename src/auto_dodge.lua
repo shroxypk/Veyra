@@ -17,6 +17,8 @@
 --     long its cooldown still runs (`cooldownWait`);
 --   * dodge only rolls when parry provably cannot cover the hit: the cooldown
 --     outlives the impact, or parry has no profile for the animation at all;
+--   * dodge only takes orphans with kind="roll". A parry-kind orphan means
+--     parry is planning to press it, so dodge stays out.
 --   * dodge never rolls while a parry session is open, because a roll cancels
 --     the parry it was waiting for.
 local G=getgenv()
@@ -182,7 +184,13 @@ local function step()
   local lockKind=parry.lockKind
   local lockFree=lockKind=="whiff" or not lockKind
    or (lockKind=="grace" and (parry.cooldownWait or 0)>(impact or math.huge))
-  local orphan=parry.orphans and parry.orphans[1]
+  -- F3: Only roll-kind orphans. A parry-kind orphan means parry is pressing it.
+  local orphan
+  if parry.orphans then
+   for _,o in ipairs(parry.orphans) do
+    if o.kind ~= "parry" then orphan=o break end
+   end
+  end
   if lockFree and orphan and orphan.remaining<=ROLL_LEAD and orphan.remaining>=-0.05 then
    reason=string.format("orphan %s %.2fs",orphan.name or "?",orphan.remaining)
   elseif lockFree and impact and impact<=ROLL_LEAD and impact>=-0.05 then
