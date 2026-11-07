@@ -39,10 +39,13 @@ class RollTimingTests(unittest.TestCase):
         self.assertIn('GetAttribute("StateDuration_Dodging") or c:GetAttribute("StateDuration_Rolling")', code)
 
     def test_roll_lead_no_static_034(self):
-        """ROLL_LEAD must not be a static 0.34 in dodge."""
+        """ROLL_LEAD must not be a static 0.34 in dodge or parry orphan publish."""
         code=(ROOT/"src/auto_dodge.lua").read_text(encoding="utf-8")
         self.assertNotIn("ROLL_LEAD=0.34", code)
         self.assertNotIn("ROLL_LEAD=0.475", code)
+        code2=(ROOT/"src/auto_parry.lua").read_text(encoding="utf-8")
+        self.assertNotIn('"rollLead",0.34', code2)
+        self.assertIn('getAsset(candidate.id,"rollLead",rollLead())', code2)
 
     def test_dodge_uses_parry_roll_lead(self):
         """Dodge must use parry.rollLead when present."""

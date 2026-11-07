@@ -1226,8 +1226,11 @@ local function step()
    local remaining=(candidate.hit-position)/track.Speed
    -- C7: AoE assets publish to orphans with kind="roll", never a parry press
    if isAOE(candidate) and remaining<=1.5 then
-    local rollLead=getAsset(candidate.id,"rollLead",0.34)
-    aoeOrphans[#aoeOrphans+1]={kind="roll",remaining=remaining,rollLead=rollLead,
+    -- C15: rollLead is rollDur/2 + outbound (learned roll duration), not a
+    -- per-asset constant. No profile defines a per-asset rollLead, so fall
+    -- back to the computed value rather than a stale literal.
+    local orphanLead=getAsset(candidate.id,"rollLead",rollLead())
+    aoeOrphans[#aoeOrphans+1]={kind="roll",remaining=remaining,rollLead=orphanLead,
      name=candidate.name,id=candidate.id}
    end
    if myRoot and remaining<=ATTACK_RELEASE_HORIZON then

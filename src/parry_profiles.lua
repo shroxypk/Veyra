@@ -86,7 +86,7 @@ return {
  ["13990348548"]={name="VerticalStrike",length=1.159990,hits={0.879990}},
  ["13990394139"]={name="PiercingFlurry",length=1.919990,hits={1.519990}},
  ["14056852710"]={name="Flourish",length=1.200000,hits={0.275000,0.750000}},
- ["140664544166823"]={name="Vicious Assault",length=1.016660,hits={0.153750,0.983330}},
+ ["140664544166823"]={name="Vicious Assault",length=1.016660,hits={0.481000,0.706000}},
  ["14158890923"]={name="Golem 1",length=0.920000,hits={0.669160}},
  ["14158953103"]={name="Golem 2",length=0.800000,hits={0.463330}},
  ["14450307160"]={name="TempestPalm",length=0.899990,hits={0.666660}},
