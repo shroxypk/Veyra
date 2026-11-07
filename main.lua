@@ -2411,7 +2411,86 @@ local function parryWindow()
 end
 
 -- ============================================================
--- PERSISTENCE HELPERS
+-- PER-ASSET PARAMETER STORE (C1)
+-- ============================================================
+local HttpService=game:GetService("HttpService")
+local LEARNED_PATH="Veyra/parry_learned.json"
+local LEARNED_VERSION=1
+local learned={version=LEARNED_VERSION,placeVersion=0,assets={}}
+
+local function loadLearned()
+    if type(readfile)~="function" then return end
+    local ok,raw=pcall(readfile,LEARNED_PATH)
+    if not ok or type(raw)~="string" or #raw==0 then return end
+    local okDecode,data=pcall(function() return HttpService:JSONDecode(raw) end)
+    if not okDecode or type(data)~="table" then return end
+    if data.version~=LEARNED_VERSION then return end
+    learned=data
+    -- One-shot migration from old config.json selfImproving
+    local old=prefs.selfImproving
+    if old and type(old)=="table" and not learned.migrated then
+        for id,val in pairs(old.bias or {}) do
+            learned.assets[id]=learned.assets[id] or {}
+            learned.assets[id].parryOffset=val
+        end
+        for id,val in pairs(old.derivedHitOffset or {}) do
+            learned.assets[id]=learned.assets[id] or {}
+            learned.assets[id].derivedHitOffset=val
+        end
+        for id,val in pairs(old.mobReach or {}) do
+            learned.assets[id]=learned.assets[id] or {}
+            learned.assets[id].reach=val
+        end
+        for id,val in pairs(old.unparryable or {}) do
+            learned.assets[id]=learned.assets[id] or {}
+            if val==true then learned.assets[id].unparryable=true end
+        end
+        for id,val in pairs(old.unparryableStrikes or {}) do
+            learned.assets[id]=learned.assets[id] or {}
+            learned.assets[id].strikes=val
+        end
+        for id,val in pairs(old.clusterThreshold or {}) do
+            learned.assets[id]=learned.assets[id] or {}
+            learned.assets[id].clusterThreshold=val
+        end
+        learned.migrated=true
+        saveLearned()
+    end
+end
+
+local function saveLearned()
+    if type(writefile)~="function" then return end
+    local ok,encoded=pcall(function() return HttpService:JSONEncode(learned) end)
+    if not ok or type(encoded)~="string" then return end
+    if type(makefolder)=="function" then pcall(makefolder,"Veyra") end
+    pcall(writefile,LEARNED_PATH,encoded)
+end
+
+loadLearned()
+
+-- Fallback chain: learned asset value -> static table -> class default -> hard default
+local function getAsset(id,key,classDefault,hardDefault)
+    local a=learned.assets[id]
+    if a and a[key]~=nil then return a[key] end
+    local p=profiles_[id] or derived[id]
+    if p and p[key]~=nil then return p[key] end
+    return classDefault or hardDefault
+end
+
+local function setAsset(id,key,value)
+    learned.assets[id]=learned.assets[id] or {}
+    learned.assets[id][key]=value
+    saveLearned()
+end
+
+local function incAssetStat(id,key,delta)
+    learned.assets[id]=learned.assets[id] or {}
+    learned.assets[id][key]=(learned.assets[id][key] or 0)+delta
+    saveLearned()
+end
+
+-- ============================================================
+-- PERSISTENCE HELPERS (legacy config.json for global lead/grantLag/parryWindow)
 -- ============================================================
 local function saveSelfImproving()
     if not G.VeyraConfig or not G.VeyraConfig.set then return end
@@ -2420,12 +2499,6 @@ local function saveSelfImproving()
             lead = state.lead,
             grantLag = state.grantLag,
             parryWindow = state.parryWindow,
-            bias = state.bias,
-            mobReach = state.mobReach,
-            unparryable = state.unparryableVerified,
-            unparryableStrikes = state.unparryableStrikes,
-            clusterThreshold = state.clusterThreshold,
-            derivedHitOffset = state.derivedHitOffset,
             calibrated = state.calibrated,
         }
     })
@@ -2627,8 +2700,8 @@ local function deriveHits(frames,length,id)
  if #peaks==0 then return nil end
  -- Cluster threshold and scheduling offset are per-asset once the fight data
  -- has taught them; until then use the measured defaults.
- local clusterThresh=(id and state.clusterThreshold[id]) or 0.28
- local offset=(id and state.derivedHitOffset[id]) or 0.03
+ local clusterThresh=getAsset(id,"clusterThreshold",0.28)
+ local offset=getAsset(id,"parryOffset",getAsset(id,"derivedHitOffset",0.03))
  local hits,cluster={},{peaks[1]}
  for cursor=2,#peaks do
   if peaks[cursor]-cluster[#cluster]<=clusterThresh then
@@ -2727,33 +2800,34 @@ local function bindCharacter(c)
         -- ambiguous, not proof: it may be a second strike of the same clip.
         -- Count them separately from the confirmed-unparryable set and only
         -- promote after UNPARRY_CONFIRM of them with no deflection.
-        local strikes=(state.unparryableStrikes[activeAttempt.asset] or 0)+1
-        state.unparryableStrikes[activeAttempt.asset]=strikes
-        if strikes>=UNPARRY_CONFIRM and state.unparryableVerified[activeAttempt.asset]~=true then
-         state.unparryableVerified[activeAttempt.asset]=true
+        local strikes=(getAsset(activeAttempt.asset,"strikes",0))+1
+        setAsset(activeAttempt.asset,"strikes",strikes)
+        if strikes>=UNPARRY_CONFIRM and getAsset(activeAttempt.asset,"unparryable",nil)~=true then
+         setAsset(activeAttempt.asset,"unparryable",true)
          log(string.format("unparryable confirmed: %s (%d strikes)",activeAttempt.asset,strikes))
         end
         table.insert(state.hitResiduals,string.format("%s %+.3f near prediction -> ambiguous (%d)",
          activeAttempt.name,residual,strikes))
         note=note..string.format(" residual %+.3fs near prediction (ambiguous damage)",residual)
-        markSiDirty()
+        saveLearned()
        else
         table.insert(state.hitResiduals,string.format("%s %+.3f %s damage",
          activeAttempt.name,residual,oc))
         note=note..string.format(" residual %+.3fs (%s)",residual,oc)
         if granted and (oc=="early" or oc=="late") then
-         state.bias[activeAttempt.asset]=timing.learnBias(state.bias[activeAttempt.asset],residual)
-         log(string.format("bias %s: %+.4f",activeAttempt.asset,state.bias[activeAttempt.asset]))
-         markSiDirty()
+         local currentBias=getAsset(activeAttempt.asset,"parryOffset",0)
+         local newBias=timing.learnBias(currentBias,residual)
+         setAsset(activeAttempt.asset,"parryOffset",newBias)
+         log(string.format("bias %s: %+.4f",activeAttempt.asset,newBias))
         end
        end
        -- A hit that landed means this attacker really does reach that far:
        -- fold the press-time distance into the per-asset reach estimate.
        if granted and activeAttempt.distance and activeAttempt.asset then
-        local current=state.mobReach[activeAttempt.asset] or 8
-        state.mobReach[activeAttempt.asset]=math.clamp(current*0.85+activeAttempt.distance*0.15,5,14)
-        log(string.format("reach %s: %.1f",activeAttempt.asset,state.mobReach[activeAttempt.asset]))
-        markSiDirty()
+        local current=getAsset(activeAttempt.asset,"reach",8)
+        local newReach=math.clamp(current*0.85+activeAttempt.distance*0.15,5,14)
+        setAsset(activeAttempt.asset,"reach",newReach)
+        log(string.format("reach %s: %.1f",activeAttempt.asset,newReach))
        end
        while #state.hitResiduals>20 do table.remove(state.hitResiduals,1) end
       end
@@ -2808,12 +2882,9 @@ local function bindCharacter(c)
      -- A confirmed deflection is proof of parryability: clear both the strike
      -- counter and any confirmation, and record `false` so the base list can
      -- never re-suppress this asset.
-     state.unparryableStrikes[id]=nil
-     if state.unparryableVerified[id]~=false then
-      state.unparryableVerified[id]=false
-      log(string.format("verified parryable: %s",id))
-      markSiDirty()
-     end
+     setAsset(id,"strikes",0)
+     setAsset(id,"unparryable",false)
+     log(string.format("verified parryable: %s",id))
     end
    end
    log("CONFIRMED deflection"..(activeAttempt and (" near "..activeAttempt.name) or ""))
@@ -2995,8 +3066,11 @@ local MOB_REACH = {
 local DEFAULT_REACH = 8
 
 local function getReach(candidate)
- if candidate.id and state.mobReach[candidate.id] then return state.mobReach[candidate.id] end
- if candidate.id and MOB_REACH[candidate.id] then return MOB_REACH[candidate.id] end
+ if candidate.id then
+  local learned=getAsset(candidate.id,"reach",nil)
+  if learned then return learned end
+  if MOB_REACH[candidate.id] then return MOB_REACH[candidate.id] end
+ end
  local name = (candidate.model and candidate.model.Name) or ""
  if name:find("Guard") or name:find("Sentinel") then return 9 end
  if name:find("Knight") or name:find("Brute") then return 10 end
@@ -3026,7 +3100,7 @@ local UNPARRYABLE_BASE = {
 local function isUnparryable(candidate)
  local id=candidate.id
  if id then
-  local verdict=state.unparryableVerified[id]
+  local verdict=getAsset(id,"unparryable",nil)
   if verdict==true then return true end
   if verdict==false then return false end -- verified parryable, never re-suppress
   if UNPARRYABLE_BASE[id] then return true end -- base list, not yet tested
@@ -3174,14 +3248,14 @@ local function step()
      end
      if minGap > 0 and minGap < 2 then
       local learned = math.clamp(minGap * 0.9, 0.2, 0.6)
-      if math.abs((state.clusterThreshold[candidate.id] or 0) - learned) > 0.005 then
-       state.clusterThreshold[candidate.id] = learned
-       markSiDirty()
+      local current = getAsset(candidate.id,"clusterThreshold",0.28)
+      if math.abs(current - learned) > 0.005 then
+       setAsset(candidate.id,"clusterThreshold",learned)
       end
      end
     end
    end
-   local effective=state.lead+state.leadOffset+(state.bias[candidate.id] or candidate.offset or 0)
+   local effective=state.lead+state.leadOffset+(getAsset(candidate.id,"parryOffset",0) or candidate.offset or 0)
    local at,latest=timing.window(position,track.Speed,candidate.hit,effective,
     parryWindow()/2,candidate.gate)
    if latest and latest< -0.05 then
