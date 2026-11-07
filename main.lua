@@ -3300,33 +3300,65 @@ local function step()
   end
  end
 
- -- Chain plan: greedily take the earliest impact, then only hits that land a
- -- full post-success lockout later. Everything else becomes an orphan that
- -- Auto Dodge is allowed to roll for. The plan is rebuilt every frame while a
- -- lock is active, so it survives the session and the grace window.
- table.sort(chainCands,function(a,b) return a.remaining<b.remaining end)
- local chained={}
- state.orphans={}
- local chainEnd=-math.huge
- local coveredUntil=-math.huge
- for _,entry in ipairs(chainCands) do
-  local impactAt=now+entry.remaining
-  if impactAt<=coveredUntil then
-   -- The parry chosen for an earlier impact is still granted here.
-   entry.candidate.covered=true
-  elseif impactAt>=chainEnd then
-   chained[#chained+1]=entry
-   if not best then
-    best,bestLatest=entry.candidate,entry.latest
-    best.remaining=entry.remaining
+ -- Chain plan: coverage-maximising assignment (C4).
+  -- For each pair of candidates within one lockout, compare parry-then-drop
+  -- against roll-then-parry by covered-hit count and choose the better.
+  -- Emit assignments as {kind="parry"|"roll", candidate} on state.orphans.
+  -- kind="parry" entries still become presses. Break ties toward parry.
+  table.sort(chainCands,function(a,b) return a.remaining<b.remaining end)
+  local n=#chainCands
+  local assign={} -- "parry" or "roll" for each candidate
+  local i=1
+  while i<=n do
+   local entry=chainCands[i]
+   local impactAt=now+entry.remaining
+   -- Look ahead to find all candidates within GRACE_LOCK of this one
+   local j=i+1
+   local group={entry}
+   while j<=n and (now+chainCands[j].remaining)<=impactAt+GRACE_LOCK+0.03 do
+    group[#group+1]=chainCands[j]
+    j+=1
    end
-   coveredUntil=impactAt+parryWindow()/2
-   chainEnd=impactAt+GRACE_LOCK+0.03
-  else
-   state.orphans[#state.orphans+1]={remaining=entry.remaining,
+   if #group==1 then
+    -- Single candidate, always parry
+    assign[i]="parry"
+   else
+    -- Multiple candidates within one lockout window
+    -- Evaluate: parry first + drop rest vs roll first + parry rest
+    local parryFirst=1 -- first is parried
+    for k=2,#group do
+     -- Can we parry subsequent hits if we parry first?
+     local nextImpact=now+group[k].remaining
+     if nextImpact>=impactAt+GRACE_LOCK+0.03 then
+      parryFirst=parryFirst+1
+     end
+    end
+    local rollFirst=#group-1 -- roll first, parry the rest
+    -- Choose whichever gives more parried hits; tie -> parry
+    if parryFirst>=rollFirst then
+     assign[i]="parry"
+     for k=2,#group do assign[i+k-1]="roll" end
+    else
+     assign[i]="roll"
+     for k=2,#group do assign[i+k-1]="parry" end
+    end
+   end
+   i=j
+  end
+  -- Build orphans with kind
+  state.orphans={}
+  for idx,entry in ipairs(chainCands) do
+   local kind=assign[idx] or "roll"
+   if kind=="parry" then
+    if not best then
+     best,bestLatest=entry.candidate,entry.latest
+     best.remaining=entry.remaining
+    end
+    entry.candidate.covered=true
+   end
+   state.orphans[#state.orphans+1]={kind=kind,remaining=entry.remaining,
     name=entry.candidate.name,id=entry.candidate.id}
   end
- end
 
  state.impactIn=nearestInbound
  state.impactId=nearestInboundId
