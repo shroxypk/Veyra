@@ -105,6 +105,17 @@ local LEARNED_PATH="Veyra/parry_learned.json"
 local LEARNED_VERSION=1
 local learned={version=LEARNED_VERSION,placeVersion=0,assets={}}
 
+-- C11: Store placeVersion; on change, mark all authored profiles stale.
+local function initPlaceVersion()
+  local pv=game.PlaceId or 0
+  if learned.placeVersion~=pv then
+   learned.placeVersion=pv
+   for id,_ in pairs(learned.assets) do
+    learned.assets[id].stale=true
+   end
+  end
+end
+
 local function loadLearned()
     if type(readfile)~="function" then return end
     local ok,raw=pcall(readfile,LEARNED_PATH)
@@ -154,6 +165,7 @@ local function saveLearned()
 end
 
 loadLearned()
+initPlaceVersion()
 
 -- Fallback chain: learned asset value -> static table -> class default -> hard default
 local function getAsset(id,key,classDefault,hardDefault)
@@ -593,6 +605,9 @@ local function bindCharacter(c)
       stats.damage.sum=stats.damage.sum+dmg
       stats.damage.sumSq=stats.damage.sumSq+dmg*dmg
       setAsset(bestAsset,"damage",stats.damage)
+      -- C11: Track losses for profile decay
+      incAssetStat(bestAsset,"losses",1)
+      checkProfileDecay(bestAsset)
      end
      local residual=0
      local position=bestCand.cand.track.TimePosition
@@ -688,6 +703,8 @@ local function bindCharacter(c)
     if activeAttempt.asset then
      local id=activeAttempt.asset
      state.successByAsset[id]=(state.successByAsset[id] or 0)+1
+     -- C11: Track wins for profile decay
+     incAssetStat(id,"wins",1)
      -- A confirmed deflection is proof of parryability: clear both the strike
      -- counter and any confirmation, and record `false` so the base list can
      -- never re-suppress this asset.
@@ -818,6 +835,26 @@ local function isAOE(candidate)
   -- we classify it. Spike width is derived from keyframe data but we don't
   -- have it at runtime, so we use name + state signals.
   return false
+end
+
+-- C11: Profile decay - demote authored profile to derived when win rate is poor.
+local function checkProfileDecay(id)
+  local stats=learned.assets[id]
+  if not stats then return end
+  local wins=stats.wins or 0
+  local losses=stats.losses or 0
+  if losses>=5 then
+    local total=wins+losses
+    local winRate=total>0 and (wins/total) or 1
+    if winRate<0.35 then
+      if profiles_[id] and not stats.demoted then
+        log(string.format("profile decay: %s demoted (win rate %.2f)",id,winRate))
+        setAsset(id,"demoted",true)
+        deriveTried[id]=nil
+        derive(id,profiles_[id].name)
+      end
+    end
+  end
 end
 
 local function observe(model,track)
