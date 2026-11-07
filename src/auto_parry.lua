@@ -259,6 +259,7 @@ local worker,packet,attackInput,manager,character,healthConnection,attributeConn
 local session=nil
 local lastSent=-math.huge
 local nextScan=0
+local lastRTTUpdate=0
 local pendingGate
 local activeAttempt
 local serverAnimations={}
@@ -1164,8 +1165,8 @@ local function step()
  if deriveDirty and now>=deriveSaveAt then deriveSaveAt=now+2 saveDerived() end
  if now>=nextScan then nextScan=now+0.4 scan() end
  -- Update RTT samples periodically (every ~2s)
- if not step.lastRTTUpdate or now-step.lastRTTUpdate>2 then
-  step.lastRTTUpdate=now
+ if not lastRTTUpdate or now-lastRTTUpdate>2 then
+  lastRTTUpdate=now
   task.spawn(updateRTT)
  end
  flushSiIfNeeded()
