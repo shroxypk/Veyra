@@ -165,8 +165,10 @@ Each of these exists because the alternative costs the ~1 s lockout:
 
 ### Mob coverage and pose-derived candidates
 
-The bundled table contains 176 marker profiles and 11 additional pose-derived
-profiles. Authored entries take precedence. Unknown non-looping candidate
+The bundled table contains 217 profiles: 176 marker-authored profiles plus
+41 pose-derived profiles covering Halloween boss attacks, Magic/Dagon skills,
+and player skill animations, all derived from keyframe pose bursts with the
+estimator below. Authored entries take precedence. Unknown non-looping candidate
 animations can be fetched once per session; successful estimates are cached in
 `Veyra/parry_derived.json` with best-effort file I/O.
 
@@ -182,6 +184,17 @@ Two additional profiles produced no retained burst. These are exploratory
 comparisons, not held-out validation or a measured parry success rate. Missing
 and extra predicted hits, attack classification, latency and server rules can
 still cause failures on unseen attacks.
+
+Live recon (2026-11-07 collector run, Clover place 8248288152) validated the
+bundled profiles against 648 measured impacts across 48 assets: the median
+impact time matched the nearest profiled hit within 0.15 seconds for 26 of 35
+assets with at least 3 observations, and first-impact timing matched for most
+of the remaining combo assets (where medians are contaminated by chain hits).
+`StateDuration_Dodging` was uniformly 0.275 and `StateDuration_AllowCancel`
+0.206 (matching the roll-timing defaults), `StateDuration_DashCooldown` 1.5.
+Assets present in the server but not yet observed in combat (Halloween bosses,
+Beast and Dagon skills) carry pose-derived estimates, corrected at runtime by
+residual attribution.
 
 The first unknown swing may receive a defensive block, capped at 1.5 seconds,
 when ready, in range, and with no profiled attacks pending. It releases when
