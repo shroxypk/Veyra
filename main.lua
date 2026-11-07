@@ -2933,6 +2933,8 @@ local function ready(ignoreGrace)
  return root
 end
 
+local graceOverlapCount=0
+
 local function lockEndsAt(c,now)
  local ok,server=pcall(function() return workspace:GetServerTimeNow() end)
  if not ok or type(server)~="number" then return nil end
@@ -2942,15 +2944,26 @@ local function lockEndsAt(c,now)
   if at>now then return at,"whiff" end
  end
  if c:GetAttribute("State_ParryCooldown")==true then return now+WHIFF_LOCK,"whiff" end
+ -- Grace lock: use max of APF and ParriedAttack expiries, not sum.
+ -- A successful parry removes ParryCooldown and applies APF (0.5s) + ParriedAttack (0.25s) simultaneously.
+ -- The lockout is the later of the two, not their sum.
+ local apfEnd=nil
+ local paEnd=nil
+ local e=c:GetAttribute("StateEnd_APF")
+ if type(e)=="number" then apfEnd=now+math.max(0,e-server) end
+ e=c:GetAttribute("StateEnd_ParriedAttack")
+ if type(e)=="number" then paEnd=now+math.max(0,e-server) end
  local graceAt
- for _,name in ipairs({"Parrying","APF","ParriedAttack"}) do
-  local e=c:GetAttribute("StateEnd_"..name)
-  if type(e)=="number" then
-   local at=now+math.max(0,e-server)
-   if at>now and (not graceAt or at>graceAt) then graceAt=at end
-  end
+ if apfEnd and paEnd then
+  graceAt=math.max(apfEnd,paEnd)
+  graceOverlapCount+=1
+ elseif apfEnd then
+  graceAt=apfEnd
+ elseif paEnd then
+  graceAt=paEnd
  end
- if graceAt then return graceAt,"grace" end
+ if graceAt and graceAt>now then return graceAt,"grace" end
+ -- Fallbacks if StateEnd_* not present
  if c:GetAttribute("State_APF")==true then return now+GRACE_LOCK,"grace" end
  if c:GetAttribute("State_ParriedAttack")==true then return now+0.25,"grace" end
  return nil
@@ -3222,8 +3235,9 @@ local function step()
  if root then
   state.lockKind=lockKind
   state.cooldownWait=lockKind and state.cooldownWait or 0
-  state.status=string.format("Parry · %d in · %d parried · %d hit · %s",
-   state.attempts,state.confirmed,state.damageEvents,lockKind or "ready")
+  state.status=string.format("Parry · %d in · %d parried · %d hit · %s%s",
+   state.attempts,state.confirmed,state.damageEvents,lockKind or "ready",
+   lockKind=="grace" and (" graceOverlaps="..graceOverlapCount) or "")
   state.blockedReason=nil
  else
   state.lockKind=nil
