@@ -11,30 +11,76 @@ probes:
 
 | Quantity | Value | How it was obtained |
 | --- | --- | --- |
-| Granted parry window | `0.25 s` (`StateDuration_Parrying`) | constant across every grant observed |
+| Granted parry window | `0.30 s` (`StateDuration_Parrying`) | constant across every grant observed |
 | Send to grant (`outbound`) | `0.056 - 0.073 s` | `StateEnd_Parrying - StateDuration_Parrying - GetServerTimeNow()` sampled at send |
 | Grant visible on client | `0.150 - 0.236 s` | attribute replication, i.e. `outbound` plus the inbound leg |
-| Lockout after a whiff | `0.93 - 0.97 s` to `CanParry` again | measured `sentToCanParry` |
+| Lockout after a whiff | `0.93 - 0.97 s` (measured `StateDuration_ParryCooldown = 1.25`) | measured `sentToCanParry` |
 | Successful parry | removes `ParryCooldown`, adds `APF` 0.5 s + `ParriedAttack` 0.25 s | `CastFn_Counter` |
 
 `End Block` does not cancel a granted window (11 of 12 measured), so a press is a
 short pulse, not a hold. Pressing again while a window is open cannot extend it.
+
+## Lockout is max, not sum
+
+A successful parry removes `ParryCooldown` and applies `APF` (0.5s) and
+`ParriedAttack` (0.25s) simultaneously. The lockout is the later of the two
+expiries, not their sum. The scheduler computes:
+
+```lua
+grace = max(StateEnd_APF, StateEnd_ParriedAttack)
+```
+
+This means a second hit arriving 0.4s after a successful parry is covered by
+the grace window (APF ends at 0.5s), not forced into an orphan.
 
 ## Why the press is centred where it is
 
 The animation track is itself delayed by the inbound leg, so an impact authored
 at marker time `m` lands on this client's clock at `trackStart + m`: the inbound
 delay cancels. A press sent at local time `S` opens the parry at `S + outbound`.
-The impact therefore has to fall in `[S + outbound, S + outbound + 0.25]`, which
+The impact therefore has to fall in `[S + outbound, S + outbound + 0.30]`, which
 puts the ideal press at:
 
 ```
-S = impact - outbound - 0.125
+S = impact - outbound - 0.15
 ```
 
 The pre-fix code used the *observed* grant lag (`0.15 s`) as the lead, pressing
 about 90 ms too early. `tests/runtime/verify_parry_coverage.lua` quantifies that
 mistake: it misses 972 of the residuals the current build covers.
+
+## Coverage-maximising chain assignment
+
+When two attacks arrive within one lockout window (0.75s), the scheduler
+compares two strategies:
+
+1. **Parry first, drop second**: 1 parry + 0 parries
+2. **Roll first, parry second**: 0 parries + 1 parry (if spacing allows)
+
+It chooses whichever covers more hits. Ties break toward parry. Assignments
+are emitted as `{kind="parry"|"roll", candidate}` on `state.orphans`. The
+`kind="parry"` entries still become presses; `kind="roll"` entries are for
+Auto Dodge.
+
+## AoE route
+
+Assets classified as AoE never produce parry presses. Classification triggers:
+- Name matches `screech|roar|bomb|summon|explosion|field|rupture`
+- Attacker carries `State_HyperArmor`
+- Learned from C1 store as `aoe=true`
+
+AoE assets publish to orphans with `kind="roll"` and use their own learned
+`rollLead` (default 0.34s). Examples: Screech, Bomb, RageScreech.
+
+## Profile decay
+
+Per-asset wins/losses are tracked in `Veyra/parry_learned.json`. When:
+- Losses >= 5 AND
+- Win rate < 0.35
+
+The authored profile is demoted to derived and re-derived once from keyframes.
+`placeVersion` is stored; on change, all authored profiles are marked stale
+and re-derived on first sight.
 
 ## Marker accuracy was measured, not assumed
 
@@ -75,31 +121,54 @@ Each of these exists because the alternative costs the ~1 s lockout:
 - no press when the attacker is out of range, above/below the character, or
   facing away (dot product below `0.25`), unless the swing starts inside 8 studs
   where spin attacks make facing meaningless;
+- no press while `State_Burning` is set (burn ticks are unparryable);
 - sending a press does not discard other pending attacks: the server may reject
   the input. State and cooldown gates regulate subsequent presses.
 
 ## Learning rules
 
-- **Health changes are diagnostic only.** They do not identify an attacker or
-  distinguish melee damage from periodic effects, so they never update `bias`
-  automatically. Clean offline observations can still supply a baked `offset`.
-- **Damage near a predicted impact** is ambiguous even after a grant. Damage
-  replication and nearby attacks prevent reliable attribution. These events
-  remain diagnostic counts (`unparryable`, a legacy field name), but no longer
-  blacklist an animation or update its timing bias.
+- **Attribution scoring**: Damage is scored across all pending candidates by
+  facing cone (0.3), reach margin (0.2), LOS (0.2), track-position fit (0.2),
+  and damage-magnitude z-score (0.1). Learning only occurs when the top score
+  beats the runner-up by 0.25. Ambiguous events are diagnostic only.
+- **Bias/unparryable**: Learned from damage residuals only when attribution is
+  confident. Strike counters track ambiguous hits; 2 strikes confirms
+  unparryable, 2 parries clears it.
 - **Cooldown expiry** comes from `StateEnd_ParryCooldown` when present, because
   the replicated flag clears one inbound leg late and waiting for it moves the
   next press ~0.1 s too late.
-  Anticipating expiry never relaxes the other `CanParry` predicates (blocking,
+  Anticipating expiry never relaxes the other `CanBlock` predicates (blocking,
   incapacitation, dodging, parrying, skills, flying, occupation, or attacking).
 - **Calibration is optional.** Pending attacks continue through the scheduler
   while it waits, and a real press cancels the idle calibration pulse.
 
 ## Honest ceiling
 
+### What remains
+
+- **Unknown mob animations**: The pose-derived system can estimate impacts from
+  keyframe motion, but has not been validated against live combat data for
+  the Dire Wolf, Alke, lizard, ogre, golem, zombie, graveyard, and pumpkin
+  sets. The collector (`tools/collector_v4.lua`) captures facing, LOS,
+  HyperArmor, burning state, and RTT to improve these estimates.
+
+- **Multi-attacker attribution**: When two mobs attack simultaneously, the
+  scoring system may still misattribute damage. The 0.25 margin requirement
+  prevents bad learning, but coverage could suffer.
+
+- **Projectile tracking**: Ballistic projectiles are detected via DescendantAdded
+  and velocity checks, but this does not cover homing or AoE fields.
+
+- **Server rejection**: The reject inference (ParryCooldown without Parrying)
+  triggers a re-press, but the server-side reason for rejection is not visible
+  to the client.
+
+- **Mobile/touch**: The system assumes keyboard/mouse input. Touch devices
+  may not support the same keybind checks.
+
 ### Mob coverage and pose-derived candidates
 
-The bundled table contains 165 marker profiles and 11 additional pose-derived
+The bundled table contains 176 marker profiles and 11 additional pose-derived
 profiles. Authored entries take precedence. Unknown non-looping candidate
 animations can be fetched once per session; successful estimates are cached in
 `Veyra/parry_derived.json` with best-effort file I/O.
@@ -139,7 +208,7 @@ Fresh stationary calibration on 2026-10-27 confirmed
 `StateDuration_Parrying = 0.25`, `StateDuration_ParryCooldown = 0.8`, and a
 numeric `StateEnd_ParryCooldown`. The grant became visible after 0.148 s.
 These are one-session measurements, not combat success-rate evidence.
-The interface lifecycle test also passed against the loaded 165-profile build.
+The interface lifecycle test also passed against the loaded 176-profile build.
 
 `getgenv().VeyraParry` exposes:
 
@@ -178,9 +247,10 @@ multiple enemies overlap, asset attribution is approximate.
 ## Experimental attack release
 
 The scheduler can request a synthetic M1 release before an inbound attack and
-resume afterward. Its mouse-button arguments and scheduling have been corrected,
-but combat tests have not verified that this interrupts a held attack or improves
-parry success. A calibration grant is not evidence of a successful combat parry.
+resume afterward via `AttackInput.send({Action="End Attack"})` and
+`AttackInput.send({Action="Attack"})`. Combat tests have not verified that this
+interrupts a held attack or improves parry success. A calibration grant is not
+evidence of a successful combat parry.
 
 ## Auto Dodge
 
