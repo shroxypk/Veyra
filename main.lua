@@ -505,7 +505,7 @@ local prefs=config.load({
  panel={x=-1,y=-1,width=math.min(430,math.max(320,initialView.X-24)),
   height=math.min(560,math.max(420,initialView.Y-52)),preset=1},
  hotkeys={toggle="RightControl",minimize="Delete",size="Insert",panic="End"},
- parry={range=14,lead=0.1,grantLag=0.15,pressRate=0.35,releaseHorizon=0.8,sessionMin=0.16,pulseDeadline=0.55,scanRadius=150,effectiveRangeBuffer=2,closeSpinThreshold=8,heightThreshold=10,closingSpeedHorizon=0.25,facingDot=0.25,parryWindow=0.25,biasGain=0.5,biasLimit=0.15,staleSlack=0.3,staleHitSlack=0.5,attackLengthMin=0.2,attackLengthMax=6,clusterThreshold=0.28,derivedHitOffset=0.03,derivedSpeedThreshold=6,derivedPeakThreshold=0.15,derivedMinHit=0.2,derivedMaxHitSlack=0.05,biasResidualWindow=0.4,hitResidualsMax=20,unobservedGrantsMax=512,derivedMaxProfiles=512,derivedSaveInterval=2,scanInterval=0.4},
+ parry={range=14,lead=0.1,grantLag=0.15,pressRate=0.35,releaseHorizon=0.8,sessionMin=0.16,pulseDeadline=0.55,whiffLock=1.25,graceLock=0.75,scanRadius=150,effectiveRangeBuffer=2,closeSpinThreshold=8,heightThreshold=10,closingSpeedHorizon=0.25,facingDot=0.25,parryWindow=0.25,biasGain=0.5,biasLimit=0.15,staleSlack=0.3,staleHitSlack=0.5,attackLengthMin=0.2,attackLengthMax=6,clusterThreshold=0.28,derivedHitOffset=0.03,derivedSpeedThreshold=6,derivedPeakThreshold=0.15,derivedMinHit=0.2,derivedMaxHitSlack=0.05,biasResidualWindow=0.4,hitResidualsMax=20,unobservedGrantsMax=512,derivedMaxProfiles=512,derivedSaveInterval=2,scanInterval=0.4},
  quest={pins="ALL"},
 })
 H.prefs=prefs
@@ -2352,6 +2352,8 @@ local SESSION_MIN=cfg("sessionMin",0.16)
 local PULSE_DEADLINE=cfg("pulseDeadline",0.55)
 local PRESS_RATE=cfg("pressRate",0.35)
 local ATTACK_RELEASE_HORIZON=cfg("releaseHorizon",0.8)
+local WHIFF_LOCK=cfg("whiffLock",1.25)
+local GRACE_LOCK=cfg("graceLock",0.75)
 
 local profiles_=profiles
 local profileCount=0
@@ -2384,6 +2386,7 @@ local state={enabled=false,alive=true,status="Parry off",profiles=profileCount,
  unparryable={},unparryableSkips=0,cooldownWait=0,
  unobservedGrants=0,successByAsset={},
  unknownAssets={},derived=0,log={},
+ orphans={},lockKind=nil,impactIsOrphan=false,pressing=false,
  -- Self-improving runtime state
  mobReach = si.mobReach,           -- id -> reach (learned from impacts)
  unparryableVerified = si.unparryable, -- id -> true (verified unparryable)
@@ -2806,23 +2809,39 @@ local function ready(ignoreCooldown)
  if not manager then return nil,"state manager unavailable" end
  if h:GetAttribute("InSafezone")==true then return nil,"safezone" end
  if not manager:CanParry() then
-  if not ignoreCooldown or not manager:HasState("ParryCooldown")
-   or manager:IsBlocking() or manager:IsIncapacitated() or manager:IsDodging()
-   or manager:IsParrying() or manager:IsUsingSkill() or manager:IsFlying()
+  if not ignoreCooldown then return nil,gateReason(c) end
+  -- ignoreCooldown: cooldown/grace states are the lock model's business; only
+  -- hard blockers (stun, dodge, skill, attack, manual block) stop the plan.
+  if manager:IsBlocking() or manager:IsIncapacitated() or manager:IsDodging()
+   or manager:IsUsingSkill() or manager:IsFlying()
    or manager:HasAnyState("Occupied","Attacking") then
    return nil,gateReason(c)
   end
  end
- if c:GetAttribute("State_APF")==true then return nil,"APF grace" end
+ if c:GetAttribute("State_APF")==true and not ignoreCooldown then return nil,"APF grace" end
  return root
 end
 
-local function cooldownReadyAt(c,now)
- local endAt=c:GetAttribute("StateEnd_ParryCooldown")
- if type(endAt)~="number" then return -math.huge end
+local function lockEndsAt(c,now)
  local ok,server=pcall(function() return workspace:GetServerTimeNow() end)
- if not ok or type(server)~="number" then return -math.huge end
- return now+math.max(0,endAt-server)
+ if not ok or type(server)~="number" then return nil end
+ local endAt=c:GetAttribute("StateEnd_ParryCooldown")
+ if type(endAt)=="number" then
+  local at=now+math.max(0,endAt-server)
+  if at>now then return at,"whiff" end
+ end
+ local graceAt
+ for _,name in ipairs({"Parrying","APF","ParriedAttack"}) do
+  local e=c:GetAttribute("StateEnd_"..name)
+  if type(e)=="number" then
+   local at=now+math.max(0,e-server)
+   if at>now and (not graceAt or at>graceAt) then graceAt=at end
+  end
+ end
+ if graceAt then return graceAt,"grace" end
+ if c:GetAttribute("State_APF")==true then return now+0.5,"grace" end
+ if c:GetAttribute("State_ParriedAttack")==true then return now+0.25,"grace" end
+ return nil
 end
 
 local function observe(model,track)
@@ -3037,24 +3056,29 @@ local function step()
  local myRoot=player.Character and player.Character:FindFirstChild("HumanoidRootPart")
  local nearestInbound,nearestInboundName,nearestInboundId
  local notBefore=-math.huge
- if root then
-  state.status=string.format("Parry · %d inputs · %d parried · %d hit",state.attempts,state.confirmed,state.damageEvents)
-  state.blockedReason=nil
- elseif reason=="ParryCooldown" then
-  local c=player.Character
-   local r=ready(true)
-   if c and r then
-   local readyAt=cooldownReadyAt(c,now)
-   if readyAt>-math.huge then
-    root=r
-    notBefore=readyAt-state.lead+0.02
+ local lockAt,lockKind
+ local char=player.Character
+ if not root and char then
+  local unlocked=ready(true)
+  if unlocked then
+   lockAt,lockKind=lockEndsAt(char,now)
+   if lockAt then
+    root=unlocked
+    notBefore=lockAt-state.lead+0.02
     state.cooldownWait=math.max(0,notBefore-now)
+    state.lockKind=lockKind
    end
   end
-  state.status="Parry: "..reason
-  if state.blockedReason~=reason then log("waiting: "..reason) end
-  state.blockedReason=reason
+ end
+ if root then
+  state.lockKind=lockKind
+  state.cooldownWait=lockKind and state.cooldownWait or 0
+  state.status=string.format("Parry · %d in · %d parried · %d hit · %s",
+   state.attempts,state.confirmed,state.damageEvents,lockKind or "ready")
+  state.blockedReason=nil
  else
+  state.lockKind=nil
+  state.cooldownWait=0
   state.status="Parry: "..reason
   if state.blockedReason~=reason then log("waiting: "..reason) end
   state.blockedReason=reason
@@ -3068,6 +3092,8 @@ local function step()
  -- ============================================================
  -- SELF-IMPROVING: Learn clusterThreshold from profile hit spacing
  -- ============================================================
+ local best,bestLatest=nil,-math.huge
+ local chainCands={}
  for i=#pending,1,-1 do
   local candidate=pending[i]
   local track=candidate.track
@@ -3105,28 +3131,66 @@ local function step()
     PARRY_WINDOW/2,candidate.gate)
    if latest and latest< -0.05 then
     table.remove(pending,i)
-    state.missed+=1
-    log("missed "..candidate.name..": "..(candidate.blocked or "no eligible frame observed"))
+    if candidate.covered then
+     candidate.covered=nil
+    else
+     state.missed+=1
+     log("missed "..candidate.name..": "..(candidate.blocked or "no eligible frame observed"))
+    end
    elseif at and at<=0 and latest>=0 then
-    local eligible,why=false,reason
-    if root then eligible,why=incoming(candidate,root,remaining) end
-    if not eligible then
+    local okIn,why=false,reason
+    if root then okIn,why=incoming(candidate,root,remaining) end
+    if not okIn then
      candidate.blocked=why or "not ready"
-    elseif now<notBefore then
-     candidate.blocked="cooldown arrival deadline"
-    elseif now-lastSent<PRESS_RATE then
-     candidate.blocked="input rate limit"
-    elseif not bestLatest or latest<bestLatest then
-     best,bestLatest=candidate,latest
-     best.remaining=remaining
+    else
+     if now<notBefore then candidate.blocked="cooldown arrival deadline"
+     elseif now-lastSent<PRESS_RATE then candidate.blocked="input rate limit"
+     else candidate.blocked=nil end
+     chainCands[#chainCands+1]={candidate=candidate,at=at,latest=latest,remaining=remaining}
     end
    end
   end
  end
 
+ -- Chain plan: greedily take the earliest impact, then only hits that land a
+ -- full post-success lockout later. Everything else becomes an orphan that
+ -- Auto Dodge is allowed to roll for. The plan is rebuilt every frame while a
+ -- lock is active, so it survives the session and the grace window.
+ table.sort(chainCands,function(a,b) return a.remaining<b.remaining end)
+ local chained={}
+ state.orphans={}
+ local chainEnd=-math.huge
+ local coveredUntil=-math.huge
+ for _,entry in ipairs(chainCands) do
+  local impactAt=now+entry.remaining
+  if impactAt<=coveredUntil then
+   -- The parry chosen for an earlier impact is still granted here.
+   entry.candidate.covered=true
+  elseif impactAt>=chainEnd then
+   chained[#chained+1]=entry
+   if not best then
+    best,bestLatest=entry.candidate,entry.latest
+    best.remaining=entry.remaining
+   end
+   coveredUntil=impactAt+PARRY_WINDOW
+   chainEnd=impactAt+GRACE_LOCK+0.03
+  else
+   state.orphans[#state.orphans+1]={remaining=entry.remaining,
+    name=entry.candidate.name,id=entry.candidate.id}
+  end
+ end
+
  state.impactIn=nearestInbound
  state.impactId=nearestInboundId
- state.parryWindowEnd = nearestInbound and (now + nearestInbound + PARRY_WINDOW) or nil
+ local orphanHead=state.orphans[1]
+ if orphanHead and (not nearestInbound or orphanHead.remaining<nearestInbound) then
+  state.impactIn=orphanHead.remaining
+  state.impactId=orphanHead.id
+  state.impactIsOrphan=true
+ else
+  state.impactIsOrphan=false
+ end
+ state.parryWindowEnd = state.impactIn and (now + state.impactIn + PARRY_WINDOW) or nil
 
  local minigames=G.VeyraMinigames
  local busy=minigames~=nil and (minigames.active==true or minigames.round~=nil)
@@ -3149,17 +3213,15 @@ local function step()
   log("resumed attack")
  end
 
- -- ============================================================
- -- CONCURRENT ATTACK HANDLING: queue multiple presses
- -- ============================================================
- local pressed = {}
+ -- Chained presses are scheduled by later frames: a hit only enters the
+ -- eligible set once its own press window opens, so a single press per frame
+ -- is the whole scheduler. Nothing is pressed early for a future impact.
  if best and now-lastSent>=PRESS_RATE and now>=notBefore then
   pendingGate=best.gate
   if startSession(now,best.name,false) then
    activeAttempt.asset=best.id
    activeAttempt.offset=best.offset
    activeAttempt.impactAt=now+best.remaining
-   table.insert(pressed, best)
    -- Remove only this specific track+hit
    for i=#pending,1,-1 do
     local candidate=pending[i]
@@ -3170,41 +3232,19 @@ local function step()
   end
   pendingGate=nil
  end
- -- If another attack is eligible and far enough in time, press for it too
- for i=#pending,1,-1 do
-  local candidate=pending[i]
-  if candidate ~= best then
-   local remaining=(candidate.hit-candidate.track.TimePosition)/candidate.track.Speed
-   if remaining > (best.remaining or 0) + PRESS_RATE then
-    local eligible,why=false,reason
-    if root then eligible,why=incoming(candidate,root,remaining) end
-    if eligible and now-lastSent>=PRESS_RATE and now>=notBefore then
-     if startSession(now,candidate.name,false) then
-      activeAttempt.asset=candidate.id
-      activeAttempt.offset=candidate.offset
-      activeAttempt.impactAt=now+remaining
-      table.insert(pressed, candidate)
-      for j=#pending,1,-1 do
-       if pending[j].track==candidate.track and pending[j].hit==candidate.hit then
-        table.remove(pending,j)
-       end
-      end
-      break -- Only one extra press per frame
-     end
-    end
-   end
-  end
- end
 
  if activeAttempt and now-activeAttempt.time>1 then activeAttempt=nil end
 end
 
 function state.setEnabled(on)
+ _G.__PARRY_DEBUG = "SET_ENABLED CALLED: on="..tostring(on).." state.enabled="..tostring(state.enabled).." alive="..tostring(state.alive)
+ log("SET_ENABLED CALLED: on="..tostring(on).." state.enabled="..tostring(state.enabled).." alive="..tostring(state.alive))
  if not state.alive then return false end
  on=on==true
- if on==state.enabled then return on end
+ if on==state.enabled then log("EARLY RETURN: already enabled") return on end
  if not on then
   state.enabled=false
+  log("DISABLE CALLED: "..debug.traceback("",2))
   if worker then worker:Disconnect() worker=nil end
   if discoveryAdded then discoveryAdded:Disconnect() discoveryAdded=nil end
   if discoveryRemoved then discoveryRemoved:Disconnect() discoveryRemoved=nil end
@@ -3214,17 +3254,21 @@ function state.setEnabled(on)
   state.status="Parry off"
   return false
  end
+ log("ENABLING parry...")
  local ok,result=pcall(function() return require(storage.Modules.Packets).Combat.packets.BlockInput end)
  if not ok or not result or type(result.send)~="function" then
-  state.status="Parry: input unavailable" log(tostring(result)) return false
+  state.status="Parry: input unavailable" log("PACKET ERROR: "..tostring(result)) return false
  end
- packet=result state.enabled=true nextScan=0
+ packet=result
+ log("Packet loaded OK")
+ state.enabled=true nextScan=0
  discoveryAdded=workspace.DescendantAdded:Connect(function(item)
   if item:IsA("Animator") then animators[item]=true end
  end)
  discoveryRemoved=workspace.DescendantRemoving:Connect(function(item)
   if animators[item] then animators[item]=nil unwatch(item) end
  end)
+ log("Discovery connections set up")
  for _,name in ipairs({"FightableNPCS","NPCS"}) do
   local folder=workspace:FindFirstChild(name)
   if folder then
@@ -3236,15 +3280,18 @@ function state.setEnabled(on)
    end
   end
  end
+ log("Initial animators: "..tostring(#animators))
  bindCharacter(player.Character)
+ log("Character bound")
  worker=RS.Heartbeat:Connect(function()
   local success,err=pcall(step)
   if not success then
+   log("STEP ERROR: "..tostring(err))
    state.setEnabled(false)
    state.status="Parry error: "..tostring(err)
-   log(state.status)
   end
  end)
+ log("Worker connected")
  return true
 end
 
@@ -3299,8 +3346,8 @@ local worker,packet,responseConn,manager,character
 local conns={}
 local lastSent=-math.huge
 local backoffUntil=0
-local SEND_GAP=0.55   -- stay clear of DashCooldown; CanDash() is the real gate
-local ROLL_LEAD=0.42  -- roll this long before an impact parry cannot cover
+local SEND_GAP=0.5    -- stay clear of DashCooldown; CanDash() is the real gate
+local ROLL_LEAD=0.34  -- roll this long before an impact parry cannot cover
 local REACH=15        -- only react to attackers this close
 local MAX_RISE=8      -- ignore attackers this far above/below
 local SCAN_RATE=0.07
@@ -3431,18 +3478,25 @@ local function step()
 
  if parry and parry.enabled then
   local impact=parry.impactIn
-  if impact and impact<=ROLL_LEAD and impact>=-0.05 then
-   if parry.blockedReason=="ParryCooldown" then
-    local wait=parry.cooldownWait or math.huge
-    -- The server publishes the real expiry; parry aims its press at it. Only
-    -- roll when that press would still land after the hit.
-    if wait>=impact then reason=string.format("cooldown %.2fs > impact %.2fs",wait,impact) end
+  -- A grace lock only blocks us while it outlives the impact. A whiff lock
+  -- never blocks: parry is out of the fight until it expires.
+  local lockFree=(parry.lockKind~="grace")
+   or ((parry.cooldownWait or 0)>(impact or math.huge))
+  local orphan=parry.orphans and parry.orphans[1]
+  if lockFree and orphan and orphan.remaining<=ROLL_LEAD and orphan.remaining>=-0.05 then
+   reason=string.format("orphan %s %.2fs",orphan.name or "?",orphan.remaining)
+  elseif impact and impact<=ROLL_LEAD and impact>=-0.05 then
+   local wait=parry.cooldownWait or 0
+   if parry.lockKind and wait>impact then
+    reason=string.format("%s lock %.2fs > impact %.2fs",parry.lockKind,wait,impact)
+   elseif parry.blockedReason and parry.blockedReason~="ParryCooldown" then
+    reason=string.format("parry blocked %s %.2fs",parry.blockedReason,impact)
    end
   end
  end
- if not reason then
+ if not reason and (not parry or not parry.enabled) then
   local unprofiled=unprofiledImpact(parry)
-  if unprofiled and unprofiled<=ROLL_LEAD then
+  if unprofiled and unprofiled<=ROLL_LEAD and unprofiled>=-0.05 then
    reason=string.format("unprofiled impact %.2fs",unprofiled)
   end
  end
@@ -3473,7 +3527,13 @@ function state.setEnabled(on)
  if not on then
   state.enabled=false
   if worker then worker:Disconnect() worker=nil end
-  if responseConn then responseConn() responseConn=nil end
+  if responseConn then
+   if type(responseConn)=="function" then pcall(responseConn)
+   elseif type(responseConn)=="userdata" or type(responseConn)=="table" then
+    pcall(function() responseConn:Disconnect() end)
+   end
+   responseConn=nil
+  end
   for _,conn in ipairs(conns) do conn:Disconnect() end
   table.clear(conns)
   table.clear(state.animators)

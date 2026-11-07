@@ -35,8 +35,8 @@ local worker,packet,responseConn,manager,character
 local conns={}
 local lastSent=-math.huge
 local backoffUntil=0
-local SEND_GAP=0.55   -- stay clear of DashCooldown; CanDash() is the real gate
-local ROLL_LEAD=0.42  -- roll this long before an impact parry cannot cover
+local SEND_GAP=0.5    -- stay clear of DashCooldown; CanDash() is the real gate
+local ROLL_LEAD=0.34  -- roll this long before an impact parry cannot cover
 local REACH=15        -- only react to attackers this close
 local MAX_RISE=8      -- ignore attackers this far above/below
 local SCAN_RATE=0.07
@@ -167,18 +167,25 @@ local function step()
 
  if parry and parry.enabled then
   local impact=parry.impactIn
-  if impact and impact<=ROLL_LEAD and impact>=-0.05 then
-   if parry.blockedReason=="ParryCooldown" then
-    local wait=parry.cooldownWait or math.huge
-    -- The server publishes the real expiry; parry aims its press at it. Only
-    -- roll when that press would still land after the hit.
-    if wait>=impact then reason=string.format("cooldown %.2fs > impact %.2fs",wait,impact) end
+  -- A grace lock only blocks us while it outlives the impact. A whiff lock
+  -- never blocks: parry is out of the fight until it expires.
+  local lockFree=(parry.lockKind~="grace")
+   or ((parry.cooldownWait or 0)>(impact or math.huge))
+  local orphan=parry.orphans and parry.orphans[1]
+  if lockFree and orphan and orphan.remaining<=ROLL_LEAD and orphan.remaining>=-0.05 then
+   reason=string.format("orphan %s %.2fs",orphan.name or "?",orphan.remaining)
+  elseif impact and impact<=ROLL_LEAD and impact>=-0.05 then
+   local wait=parry.cooldownWait or 0
+   if parry.lockKind and wait>impact then
+    reason=string.format("%s lock %.2fs > impact %.2fs",parry.lockKind,wait,impact)
+   elseif parry.blockedReason and parry.blockedReason~="ParryCooldown" then
+    reason=string.format("parry blocked %s %.2fs",parry.blockedReason,impact)
    end
   end
  end
- if not reason then
+ if not reason and (not parry or not parry.enabled) then
   local unprofiled=unprofiledImpact(parry)
-  if unprofiled and unprofiled<=ROLL_LEAD then
+  if unprofiled and unprofiled<=ROLL_LEAD and unprofiled>=-0.05 then
    reason=string.format("unprofiled impact %.2fs",unprofiled)
   end
  end
@@ -209,7 +216,13 @@ function state.setEnabled(on)
  if not on then
   state.enabled=false
   if worker then worker:Disconnect() worker=nil end
-  if responseConn then responseConn() responseConn=nil end
+  if responseConn then
+   if type(responseConn)=="function" then pcall(responseConn)
+   elseif type(responseConn)=="userdata" or type(responseConn)=="table" then
+    pcall(function() responseConn:Disconnect() end)
+   end
+   responseConn=nil
+  end
   for _,conn in ipairs(conns) do conn:Disconnect() end
   table.clear(conns)
   table.clear(state.animators)

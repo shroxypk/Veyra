@@ -66,7 +66,7 @@ local prefs=config.load({
  panel={x=-1,y=-1,width=math.min(430,math.max(320,initialView.X-24)),
   height=math.min(560,math.max(420,initialView.Y-52)),preset=1},
  hotkeys={toggle="RightControl",minimize="Delete",size="Insert",panic="End"},
- parry={range=14,lead=0.1,grantLag=0.15,pressRate=0.35,releaseHorizon=0.8,sessionMin=0.16,pulseDeadline=0.55,scanRadius=150,effectiveRangeBuffer=2,closeSpinThreshold=8,heightThreshold=10,closingSpeedHorizon=0.25,facingDot=0.25,parryWindow=0.25,biasGain=0.5,biasLimit=0.15,staleSlack=0.3,staleHitSlack=0.5,attackLengthMin=0.2,attackLengthMax=6,clusterThreshold=0.28,derivedHitOffset=0.03,derivedSpeedThreshold=6,derivedPeakThreshold=0.15,derivedMinHit=0.2,derivedMaxHitSlack=0.05,biasResidualWindow=0.4,hitResidualsMax=20,unobservedGrantsMax=512,derivedMaxProfiles=512,derivedSaveInterval=2,scanInterval=0.4},
+ parry={range=14,lead=0.1,grantLag=0.15,pressRate=0.35,releaseHorizon=0.8,sessionMin=0.16,pulseDeadline=0.55,whiffLock=1.25,graceLock=0.75,scanRadius=150,effectiveRangeBuffer=2,closeSpinThreshold=8,heightThreshold=10,closingSpeedHorizon=0.25,facingDot=0.25,parryWindow=0.25,biasGain=0.5,biasLimit=0.15,staleSlack=0.3,staleHitSlack=0.5,attackLengthMin=0.2,attackLengthMax=6,clusterThreshold=0.28,derivedHitOffset=0.03,derivedSpeedThreshold=6,derivedPeakThreshold=0.15,derivedMinHit=0.2,derivedMaxHitSlack=0.05,biasResidualWindow=0.4,hitResidualsMax=20,unobservedGrantsMax=512,derivedMaxProfiles=512,derivedSaveInterval=2,scanInterval=0.4},
  quest={pins="ALL"},
 })
 H.prefs=prefs
