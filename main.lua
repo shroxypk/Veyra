@@ -2830,6 +2830,7 @@ local function lockEndsAt(c,now)
   local at=now+math.max(0,endAt-server)
   if at>now then return at,"whiff" end
  end
+ if c:GetAttribute("State_ParryCooldown")==true then return now+WHIFF_LOCK,"whiff" end
  local graceAt
  for _,name in ipairs({"Parrying","APF","ParriedAttack"}) do
   local e=c:GetAttribute("StateEnd_"..name)
@@ -2839,7 +2840,7 @@ local function lockEndsAt(c,now)
   end
  end
  if graceAt then return graceAt,"grace" end
- if c:GetAttribute("State_APF")==true then return now+0.5,"grace" end
+ if c:GetAttribute("State_APF")==true then return now+GRACE_LOCK,"grace" end
  if c:GetAttribute("State_ParriedAttack")==true then return now+0.25,"grace" end
  return nil
 end
