@@ -3332,7 +3332,7 @@ local function step()
  if root then
   state.lockKind=lockKind
   state.cooldownWait=lockKind and state.cooldownWait or 0
-  state.status=string.format("Parry · %d in · %d parried · %d hit · %s%s",
+  state.status=string.format("Parry Â· %d in Â· %d parried Â· %d hit Â· %s%s",
    state.attempts,state.confirmed,state.damageEvents,lockKind or "ready",
    lockKind=="grace" and (" graceOverlaps="..graceOverlapCount) or "")
   state.blockedReason=nil
@@ -3563,6 +3563,35 @@ function state.setEnabled(on)
  state.enabled=true nextScan=0
  discoveryAdded=workspace.DescendantAdded:Connect(function(item)
   if item:IsA("Animator") then animators[item]=true end
+  -- C8: Projectile inbound detection
+  if item:IsA("BasePart") and state.enabled then
+   local char=player.Character
+   local root=char and char:FindFirstChild("HumanoidRootPart")
+   if root then
+    local vel=item.AssemblyLinearVelocity
+    local speed=vel.Magnitude
+    if speed>1 then
+     local dir=(root.Position-item.Position)
+     local dist=dir.Magnitude
+     if dist>0.1 and dist<100 then
+      local toPlayer=dir.Unit
+      local velDir=vel.Unit
+      local dot=toPlayer:Dot(velDir)
+      if dot>0.5 then
+       local eta=dist/speed
+       if eta<1.5 then
+        for i=#state.orphans,1,-1 do
+         if state.orphans[i].id=="projectile" then table.remove(state.orphans,i) end
+        end
+        state.orphans[#state.orphans+1]={kind="roll",remaining=eta,
+         name="projectile",id="projectile",projectile=true}
+        log(string.format("projectile inbound ETA %.2fs dist %.1f speed %.1f",eta,dist,speed))
+       end
+      end
+     end
+    end
+   end
+  end
  end)
  discoveryRemoved=workspace.DescendantRemoving:Connect(function(item)
   if animators[item] then animators[item]=nil unwatch(item) end
@@ -3589,8 +3618,8 @@ function state.setEnabled(on)
    state.status="Parry error: "..tostring(err)
   end
  end)
- log(string.format("parry on · %d animators · %d profiles%s",animatorCount,profileCount,
-  attackInput and "" or " · no AttackInput"))
+ log(string.format("parry on Â· %d animators Â· %d profiles%s",animatorCount,profileCount,
+  attackInput and "" or " Â· no AttackInput"))
  return true
 end
 
