@@ -2794,6 +2794,68 @@ local function endSession(reason)
  session=nil
 end
 
+-- C10: Attribution scoring - score each candidate 0-1 from facing cone,
+-- reach margin, LOS, track-position fit and damage-magnitude z-score.
+local function scoreCandidate(candidate,damage,dmgTime,root)
+  local model=candidate.model
+  local other=model and model:FindFirstChild("HumanoidRootPart")
+  if not other or not root then return 0 end
+  local score=0
+  local weight=0
+  
+  -- Facing cone (0.3 weight)
+  local delta=root.Position-other.Position
+  local dist=delta.Magnitude
+  if dist>0.1 then
+   local facing=delta.Unit:Dot(other.CFrame.LookVector)
+   if facing>0.25 then score=score+facing*0.3 end
+   weight=weight+0.3
+  end
+  
+  -- Reach margin (0.2 weight)
+  local reach=getReach(candidate)
+  if dist<=reach+2 then
+   local margin=1-(dist-reach)/(reach+2) -- 1 at reach, 0 at reach+2
+   score=score+margin*0.2
+   weight=weight+0.2
+  else
+   weight=weight+0.2 -- candidate too far, scores 0 for this component
+  end
+  
+  -- LOS (0.2 weight)
+  if hasLOS(root,other) then score=score+0.2 end
+  weight=weight+0.2
+  
+  -- Track-position fit (0.2 weight) - how close is damage time to predicted impact?
+  local remaining=(candidate.hit-candidate.track.TimePosition)/candidate.track.Speed
+  local impactAt=dmgTime-remaining
+  local residual=math.abs(dmgTime-impactAt)
+  if residual<=0.4 then
+   score=score+(1-residual/0.4)*0.2
+   weight=weight+0.2
+  else
+   weight=weight+0.2
+  end
+  
+  -- Damage-magnitude z-score (0.1 weight) - compare to asset's damage stats from C1
+  local id=candidate.id
+  if id then
+   local stats=learned.assets[id]
+   if stats and stats.damage and stats.damage.n>=3 then
+    local mean=stats.damage.sum/stats.damage.n
+    local var=(stats.damage.sumSq - stats.damage.n*mean*mean)/stats.damage.n
+    var=math.max(var,1)
+    local std=math.sqrt(var)
+    local z=math.abs(damage-mean)/std
+    -- z<2 is good fit
+    if z<2 then score=score+(1-z/2)*0.1 end
+    weight=weight+0.1
+   end
+  end
+  
+  if weight>0 then return score/weight else return 0 end
+end
+
 local function clearCharacter()
  endSession("reset")
  table.clear(pending)
@@ -2820,50 +2882,78 @@ local function bindCharacter(c)
     state.damageEvents+=1
     local now=os.clock()
     local note="with no attempt"
-    if activeAttempt then
-     note=string.format("after %s (%.2fs)",activeAttempt.name,now-activeAttempt.time)
-     if activeAttempt.impactAt and activeAttempt.asset then
-      local residual=now-activeAttempt.impactAt
-      if math.abs(residual)<=0.4 then
-       local granted=activeAttempt.granted==true
-       local oc=granted and timing.outcome(residual,parryWindow(),-0.02) or "unobserved"
-       if granted and oc=="inside" then
-        -- A hit that lands on the predicted frame while a parry was granted is
-        -- ambiguous, not proof: it may be a second strike of the same clip.
-        -- Count them separately from the confirmed-unparryable set and only
-        -- promote after UNPARRY_CONFIRM of them with no deflection.
-        local strikes=(getAsset(activeAttempt.asset,"strikes",0))+1
-        setAsset(activeAttempt.asset,"strikes",strikes)
-        if strikes>=UNPARRY_CONFIRM and getAsset(activeAttempt.asset,"unparryable",nil)~=true then
-         setAsset(activeAttempt.asset,"unparryable",true)
-         log(string.format("unparryable confirmed: %s (%d strikes)",activeAttempt.asset,strikes))
-        end
-        table.insert(state.hitResiduals,string.format("%s %+.3f near prediction -> ambiguous (%d)",
-         activeAttempt.name,residual,strikes))
-        note=note..string.format(" residual %+.3fs near prediction (ambiguous damage)",residual)
-        saveLearned()
-       else
-        table.insert(state.hitResiduals,string.format("%s %+.3f %s damage",
-         activeAttempt.name,residual,oc))
-        note=note..string.format(" residual %+.3fs (%s)",residual,oc)
-        if granted and (oc=="early" or oc=="late") then
-         local currentBias=getAsset(activeAttempt.asset,"parryOffset",0)
-         local newBias=timing.learnBias(currentBias,residual)
-         setAsset(activeAttempt.asset,"parryOffset",newBias)
-         log(string.format("bias %s: %+.4f",activeAttempt.asset,newBias))
-        end
-       end
-       -- A hit that landed means this attacker really does reach that far:
-       -- fold the press-time distance into the per-asset reach estimate.
-       if granted and activeAttempt.distance and activeAttempt.asset then
-        local current=getAsset(activeAttempt.asset,"reach",8)
-        local newReach=math.clamp(current*0.85+activeAttempt.distance*0.15,5,14)
-        setAsset(activeAttempt.asset,"reach",newReach)
-        log(string.format("reach %s: %.1f",activeAttempt.asset,newReach))
-       end
-       while #state.hitResiduals>20 do table.remove(state.hitResiduals,1) end
-      end
+    -- C10: Score all pending candidates, pick best, learn only if top beats runner-up by 0.25
+    local root=c and c:FindFirstChild("HumanoidRootPart")
+    local scored={}
+    for _,cand in ipairs(pending) do
+     if cand.model:IsDescendantOf(workspace) and cand.track.IsPlaying then
+      local s=scoreCandidate(cand,previous-value,now,root)
+      scored[#scored+1]={cand=cand,score=s}
      end
+    end
+    table.sort(scored,function(a,b) return a.score>b.score end)
+    local bestCand=scored[1]
+    local secondCand=scored[2]
+    local learnAllowed=bestCand and (not secondCand or (bestCand.score-secondCand.score)>=0.25)
+    if bestCand then
+     local bestAsset=bestCand.cand.id
+     -- Update damage stats for attribution
+     if bestAsset then
+      local stats=learned.assets[bestAsset] or {}
+      stats.damage=stats.damage or {n=0,sum=0,sumSq=0}
+      local dmg=previous-value
+      stats.damage.n=stats.damage.n+1
+      stats.damage.sum=stats.damage.sum+dmg
+      stats.damage.sumSq=stats.damage.sumSq+dmg*dmg
+      setAsset(bestAsset,"damage",stats.damage)
+     end
+     local residual=0
+     local position=bestCand.cand.track.TimePosition
+     local remaining=(bestCand.cand.hit-position)/bestCand.cand.track.Speed
+     residual=now - (now - remaining) -- simplified: residual is 0 for best fit
+     -- Actually compute properly:
+     local impactAt=now-remaining
+     residual=now-impactAt
+     local granted=activeAttempt and activeAttempt.granted==true
+     local oc=granted and timing.outcome(residual,parryWindow(),-0.02) or "unobserved"
+     if learnAllowed then
+      if granted and oc=="inside" then
+       -- A hit that lands on the predicted frame while a parry was granted
+       local strikes=(getAsset(bestAsset,"strikes",0))+1
+       setAsset(bestAsset,"strikes",strikes)
+       if strikes>=UNPARRY_CONFIRM and getAsset(bestAsset,"unparryable",nil)~=true then
+        setAsset(bestAsset,"unparryable",true)
+        log(string.format("unparryable confirmed: %s (%d strikes)",bestAsset,strikes))
+       end
+       table.insert(state.hitResiduals,string.format("%s %+.3f near prediction -> ambiguous (%d)",
+        bestCand.cand.name,residual,strikes))
+       note=note..string.format(" residual %+.3fs near prediction (ambiguous damage)",residual)
+       saveLearned()
+      else
+       table.insert(state.hitResiduals,string.format("%s %+.3f %s damage",
+        bestCand.cand.name,residual,oc))
+       note=note..string.format(" residual %+.3fs (%s)",residual,oc)
+       if granted and (oc=="early" or oc=="late") then
+        local currentBias=getAsset(bestAsset,"parryOffset",0)
+        local newBias=timing.learnBias(currentBias,residual)
+        setAsset(bestAsset,"parryOffset",newBias)
+        log(string.format("bias %s: %+.4f",bestAsset,newBias))
+       end
+      end
+      -- Reach learning
+      local candRoot=bestCand.cand.model:FindFirstChild("HumanoidRootPart")
+      if root and candRoot then
+       local dist=(root.Position-candRoot.Position).Magnitude
+       local current=getAsset(bestAsset,"reach",8)
+       local newReach=math.clamp(current*0.85+dist*0.15,5,14)
+       setAsset(bestAsset,"reach",newReach)
+       log(string.format("reach %s: %.1f",bestAsset,newReach))
+      end
+     else
+      note=note.." (ambiguous, diagnostic only)"
+      log(string.format("diagnostic only: %s score %.2f vs %.2f",bestCand.cand.name,bestCand.score,secondCand and secondCand.score or 0))
+     end
+     while #state.hitResiduals>20 do table.remove(state.hitResiduals,1) end
     end
     log(string.format("damage %.1f %s",previous-value,note))
    end
@@ -3332,7 +3422,7 @@ local function step()
  if root then
   state.lockKind=lockKind
   state.cooldownWait=lockKind and state.cooldownWait or 0
-  state.status=string.format("Parry Â· %d in Â· %d parried Â· %d hit Â· %s%s",
+  state.status=string.format("Parry Ã‚Â· %d in Ã‚Â· %d parried Ã‚Â· %d hit Ã‚Â· %s%s",
    state.attempts,state.confirmed,state.damageEvents,lockKind or "ready",
    lockKind=="grace" and (" graceOverlaps="..graceOverlapCount) or "")
   state.blockedReason=nil
@@ -3621,8 +3711,8 @@ function state.setEnabled(on)
    state.status="Parry error: "..tostring(err)
   end
  end)
- log(string.format("parry on Â· %d animators Â· %d profiles%s",animatorCount,profileCount,
-  attackInput and "" or " Â· no AttackInput"))
+ log(string.format("parry on Ã‚Â· %d animators Ã‚Â· %d profiles%s",animatorCount,profileCount,
+  attackInput and "" or " Ã‚Â· no AttackInput"))
  return true
 end
 
