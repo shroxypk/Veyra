@@ -444,7 +444,39 @@ local function endSession(reason)
  if activeAttempt then activeAttempt.ended=os.clock() end
  if reason=="timeout" and not session.granted then
   if not session.calibration then state.unobservedGrants+=1 end
-  log("no grant observed within session")
+  -- Reject inference (C5): if ParryCooldown is set but Parrying was never granted,
+  -- the server rejected our Block Input.
+  if character and character:GetAttribute("State_ParryCooldown")==true and character:GetAttribute("State_Parrying")~=true then
+   local asset=activeAttempt and activeAttempt.asset
+   if asset then
+    local stats=learned.assets[asset] or {}
+    stats.rejects=(stats.rejects or 0)+1
+    stats.attempts=(stats.attempts or 0)+1
+    setAsset(asset,"rejects",stats.rejects)
+    setAsset(asset,"attempts",stats.attempts)
+   end
+   log("reject (ParryCooldown without Parrying)")
+   local now=os.clock()
+   if activeAttempt and activeAttempt.impactAt and activeAttempt.impactAt>now+0.05 then
+    local prevImpactAt=activeAttempt.impactAt
+    local prevName=activeAttempt.name
+    local prevModel=activeAttempt.model
+    local prevDistance=activeAttempt.distance
+    session=nil
+    if startSession(now,{name=prevName,model=prevModel},false) then
+     if asset then
+      activeAttempt.asset=asset
+      activeAttempt.impactAt=prevImpactAt
+      activeAttempt.distance=prevDistance
+      activeAttempt.rejected=true
+     end
+     log(string.format("re-press for %s (%.2fs to impact)",prevName,prevImpactAt-now))
+    end
+    return
+   end
+  else
+   log("no grant observed within session")
+  end
  end
  session=nil
 end
