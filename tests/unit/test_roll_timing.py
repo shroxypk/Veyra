@@ -64,6 +64,25 @@ class RollTimingTests(unittest.TestCase):
         self.assertIn('getAsset(id,"aoe",false)', code)
         self.assertNotIn("learned.assets[id].aoe", code)
 
+    def test_aoe_hyperarmor_not_a_signal(self):
+        """State_HyperArmor must NOT classify an attacker as AoE/unparryable.
+
+        Every FightableNPC carries State_HyperArmor (mob poise, verified live:
+        all Wolves), so gating on it blocks all mob parries. See C19.
+        """
+        code=(ROOT/"src/auto_parry.lua").read_text(encoding="utf-8")
+        self.assertNotIn('GetAttribute("State_HyperArmor")', code)
+
+    def test_aoe_name_pattern_not_pipe(self):
+        """AoE name matching must use plain-substring keywords, not a pipe pattern.
+
+        Lua patterns have no alternation; the old pipe-joined pattern matched
+        literally and never fired.
+        """
+        code=(ROOT/"src/auto_parry.lua").read_text(encoding="utf-8")
+        self.assertNotIn("screech|roar|bomb", code)
+        self.assertIn("AOE_KEYWORDS", code)
+
     def test_parry_offset_fallback(self):
         """parryOffset fallback must handle 0 as truthy (use nil check)."""
         code=(ROOT/"src/auto_parry.lua").read_text(encoding="utf-8")

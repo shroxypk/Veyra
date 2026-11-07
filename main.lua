@@ -3269,21 +3269,22 @@ local function learnProfileShape(id)
 end
 
 -- AoE classification (C7)
-local AOE_NAME_PATTERN="screech|roar|bomb|summon|explosion|field|rupture"
+-- AoE attacks are rolled, not parried. NOTE: Lua patterns have no alternation —
+-- the old pipe-joined pattern matched literally and never fired. Use plain
+-- substring matching against the AoE-skill keywords instead.
+-- NOTE: State_HyperArmor is NOT an AoE signal. In this game every FightableNPC
+-- carries it as poise (verified live: all 8 Wolves have State_HyperArmor=true),
+-- so treating it as unparryable blocks ALL mob parries. Removed.
+local AOE_KEYWORDS = {"screech", "roar", "bomb", "summon", "explosion", "field", "rupture"}
 local function isAOE(candidate)
   local id=candidate.id
   local name=(candidate.name or ""):lower()
-  -- Name-based classification
-  if name:find(AOE_NAME_PATTERN) then return true end
+  -- Name-based classification (plain substrings)
+  for _,kw in ipairs(AOE_KEYWORDS) do
+    if name:find(kw, 1, true) then return true end
+  end
   -- Learned from C1 store
   if id and getAsset(id,"aoe",false) then return true end
-  -- HyperArmor state check
-  local model=candidate.model
-  if model and model:GetAttribute("State_HyperArmor")==true then return true end
-  -- Narrow spike check (from profile data - burst width)
-  -- If the profile has a single hit and the asset is known for AoE patterns,
-  -- we classify it. Spike width is derived from keyframe data but we don't
-  -- have it at runtime, so we use name + state signals.
   return false
 end
 
