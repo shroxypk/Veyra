@@ -39,13 +39,19 @@ class FeatureInteractionTests(unittest.TestCase):
         mg = read("src/minigames.lua")
         self.assertIn("if not state.enabled or state.paused or UIS:GetFocusedTextBox() or not state.active then", mg)
 
-    def test_parry_does_not_steal_input_during_a_minigame(self):
+    def test_parry_only_sends_block_input_never_attack_packets(self):
         parry = read("src/auto_parry.lua")
-        self.assertIn("local minigames=G.VeyraMinigames", parry)
-        self.assertIn("minigames.active==true or minigames.round~=nil", parry)
-        self.assertIn("not wasAttacking and manager and myRoot and not busy", parry)
-        # The button is handed straight back when a round starts.
-        self.assertIn("if wasAttacking and (busy or (now>=resumeAt and not nearestInbound)) then", parry)
+        # Attacks cannot be cancelled client-side: AttackInput has no cancel
+        # action ("End Attack" is not real) and sending one is inert noise the
+        # server can see. The parry module owns exactly one packet: BlockInput.
+        self.assertNotIn("AttackInput", parry)
+        self.assertNotIn("End Attack", parry)
+        self.assertIn('send("Block Input")', parry)
+        self.assertIn('send("End Block")', parry)
+        # Mid-swing the honest reason is "attacking", not the ambiguous
+        # "CanBlock=false", because the player has to let the swing finish.
+        self.assertIn('ipairs({"Attacking","Critting"})', parry)
+        self.assertIn("return nil,name:lower()", parry)
 
     def test_cursor_is_owned_by_one_module(self):
         for path in (ROOT / "src").glob("*.lua"):

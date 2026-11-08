@@ -2439,9 +2439,6 @@ local UIS=game:GetService("UserInputService")
 local storage=game:GetService("ReplicatedStorage")
 local player=Players.LocalPlayer
 
-local wasAttacking=false
-local resumeAt=0
-
 -- Config-driven constants (with measured defaults)
 local prefs=G.VeyraConfig and G.VeyraConfig.values and G.VeyraConfig.values.parry or {}
 local function cfg(key,def) return prefs[key] or def end
@@ -2664,7 +2661,7 @@ end
 local animators,watches,pending={},{},{}
 local discoveryAdded,discoveryRemoved
 local seen=setmetatable({},{__mode="k"})
-local worker,packet,attackInput,manager,character,healthConnection,attributeConnection
+local worker,packet,manager,character,healthConnection,attributeConnection
 local session=nil
 local lastSent=-math.huge
 local nextScan=0
@@ -3005,8 +3002,6 @@ local function clearCharacter()
  activeAttempt=nil
  if healthConnection then healthConnection:Disconnect() healthConnection=nil end
  if attributeConnection then attributeConnection:Disconnect() attributeConnection=nil end
- wasAttacking=false
- resumeAt=0
  character,manager=nil,nil
 end
 
@@ -3198,6 +3193,13 @@ local function ready(ignoreGrace)
  if code and UIS:IsKeyDown(code) then return nil,"manual block" end
  if not manager then return nil,"state manager unavailable" end
  if h:GetAttribute("InSafezone")==true then return nil,"safezone" end
+ -- Name the reason precisely: CanBlock also refuses mid-swing, and "CanBlock=false"
+ -- alone is ambiguous in the status line. Attacks cannot be cancelled client-side
+ -- (verified: the attack packet has no cancel action), so the honest answer is "attacking".
+ for _,name in ipairs({"Attacking","Critting"}) do
+  local okA,busyState=pcall(function() return manager:HasState(name) end)
+  if okA and busyState then return nil,name:lower() end
+ end
  -- CanBlock, not CanParry: ParryCooldown and Parrying are the lock model's
  -- business, and gating on them here would make every cooldown look like a
  -- hard blocker. CanBlock is the authoritative "may I send Block Input" check.
@@ -3795,31 +3797,6 @@ local function step()
  end
  state.parryWindowEnd = state.impactIn and (now + state.impactIn + parryWindow()) or nil
 
- local minigames=G.VeyraMinigames
- local busy=minigames~=nil and (minigames.active==true or minigames.round~=nil)
- if nearestInbound and not wasAttacking and manager and myRoot and not busy then
-  local okA,isAttacking=pcall(function() return manager:HasState("Attacking") end)
-  if okA and isAttacking then
-   -- C12: Release via AttackInput packet (no VirtualInputManager).
-   if attackInput and type(attackInput.send)=="function" then
-    local ok=pcall(function() attackInput.send({Action="End Attack",SprintAttack=false}) end)
-    if ok then
-     wasAttacking=true
-     resumeAt=now+nearestInbound+0.25
-     log(string.format("released attack for inbound %s (%.2fs)",nearestInboundName,nearestInbound))
-    end
-   end
-  end
- end
- if wasAttacking and (busy or (now>=resumeAt and not nearestInbound)) then
-  -- C12: Resume via AttackInput packet.
-  if attackInput and type(attackInput.send)=="function" then
-   pcall(function() attackInput.send({Action="Attack",SprintAttack=false}) end)
-  end
-  wasAttacking=false
-  log("resumed attack")
- end
-
  -- Chained presses are scheduled by later frames: a hit only enters the
  -- eligible set once its own press window opens, so a single press per frame
  -- is the whole scheduler. Nothing is pressed early for a future impact.
@@ -3867,8 +3844,6 @@ function state.setEnabled(on)
   state.status="Parry: input unavailable" log("packet error: "..tostring(result)) return false
  end
  packet=result
- local okAttack,attack=pcall(function() return require(storage.Modules.Packets).Combat.packets.AttackInput end)
- attackInput=(okAttack and attack and type(attack.send)=="function") and attack or nil
  state.enabled=true nextScan=0
  discoveryAdded=workspace.DescendantAdded:Connect(function(item)
   if item:IsA("Animator") then animators[item]=true end
@@ -3927,8 +3902,7 @@ function state.setEnabled(on)
    state.status="Parry error: "..tostring(err)
   end
  end)
- log(string.format("parry on Ã‚Â· %d animators Ã‚Â· %d profiles%s",animatorCount,profileCount,
-  attackInput and "" or " Ã‚Â· no AttackInput"))
+ log(string.format("parry on · %d animators · %d profiles",animatorCount,profileCount))
  return true
 end
 
